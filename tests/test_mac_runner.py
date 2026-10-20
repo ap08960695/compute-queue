@@ -73,11 +73,31 @@ class MacRunnerTests(unittest.TestCase):
                 return True
             return False
 
-    def launch(self, code, lock=True, grace=None, fail_handshake=False):
+    def launch(self, code, lock=True, grace=None, fail_handshake=False, controlled_clock=False, stale_snapshot=False):
         argv = [sys.executable, str(self.script)]
-        if grace is not None or fail_handshake:
+        if grace is not None or fail_handshake or stale_snapshot:
             boot = ("import runpy,sys; sys.argv.pop(0); n=runpy.run_path(sys.argv[0]); "
                     f"n['mac_runner'].__globals__['KILL_GRACE_S']={grace or 20}\n")
+            if controlled_clock:
+                boot += (
+                    "from pathlib import Path; t=n['mac_runner'].__globals__['time']; frozen=t.monotonic()\n"
+                    f"t.monotonic=lambda: frozen+2 if Path({str(self.root / 'escalate')!r}).exists() else frozen\n"
+                )
+            if stale_snapshot:
+                boot += (
+                    "from pathlib import Path; import time\n"
+                    "original_group=n['mac_runner'].__globals__['group_running']; missed=False\n"
+                    "def group_snapshot(host, pgid):\n"
+                    " global missed\n"
+                    " if not missed:\n"
+                    f"  while not Path({str(self.ready)!r}).exists(): time.sleep(.01)\n"
+                    "  missed=True\n"
+                    "  return False\n"
+                    " result=original_group(host,pgid)\n"
+                    f" Path({str(self.root / 'snapshot-confirmed')!r}).touch()\n"
+                    " return result\n"
+                    "n['mac_runner'].__globals__['group_running']=group_snapshot\n"
+                )
             if fail_handshake:
                 boot += (
                     "original=n['atomic_write']; failed=False\n"
@@ -115,7 +135,7 @@ class MacRunnerTests(unittest.TestCase):
     def lingering_code(self, ignore_term=False):
         child = (
             "import os,time,signal; from pathlib import Path; "
-            + ("signal.signal(signal.SIGTERM, signal.SIG_IGN); " if ignore_term else "")
+            + (f"signal.signal(signal.SIGTERM, lambda *_: Path({str(self.root / 'term-seen')!r}).touch()); " if ignore_term else "")
             + f"Path({str(self.ready)!r}).write_text(str(os.getpid())); "
             "end=time.monotonic()+10\n"
             f"while not Path({str(self.release)!r}).exists() and time.monotonic()<end: time.sleep(.02)\n"
@@ -145,14 +165,26 @@ class MacRunnerTests(unittest.TestCase):
         self.assertEqual((self.sdir / "rc").read_text(), "7\n")
         self.assertFalse(self.locked())
 
+    def test_one_stale_ps_snapshot_cannot_release_lock_under_live_child(self):
+        p = self.launch(self.lingering_code(), stale_snapshot=True)
+        self.wait_for(lambda: self.state().get('done') or (self.root/'snapshot-confirmed').exists())
+        self.assertFalse(self.state().get('done', False))
+        self.assertTrue(self.locked())
+        self.release.touch()
+        _, err = p.communicate(timeout=8)
+        self.assertEqual(p.returncode, 0, err)
+        self.assertTrue(self.state()['done'])
+        self.assertFalse(self.locked())
+
     def test_stop_escalates_with_exited_leader_without_dropping_lock(self):
-        p = self.launch(self.lingering_code(ignore_term=True), grace=0.6)
+        p = self.launch(self.lingering_code(ignore_term=True), grace=0.6, controlled_clock=True)
         self.wait_for(self.ready.exists)
         self.assertTrue(self.locked())
         (self.sdir / "stop").write_text("cancel")
-        time.sleep(0.15)
+        self.wait_for((self.root / 'term-seen').exists)
         self.assertIsNone(p.poll())
         self.assertTrue(self.locked())
+        (self.root / 'escalate').touch()
         _, err = p.communicate(timeout=8)
         self.assertEqual(p.returncode, 0, err)
         self.assertTrue(self.state()["done"])

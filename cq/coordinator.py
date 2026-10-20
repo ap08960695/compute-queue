@@ -273,6 +273,10 @@ class Handler(BaseHTTPRequestHandler):
         return hold_until
 
     def read(self, db, parts, query, identity):
+        if len(parts) == 3 and parts[0] == "nodes" and parts[2] == "diagnostic":
+            self.require(identity, "node_admin")
+            return {"grants": [dict(r) for r in db.execute(
+                "SELECT * FROM diagnostic_grants WHERE node=? ORDER BY job_id", (parts[1],))]}
         self.require(identity, "view")
         if parts == ["jobs"]:
             state = query.get("state", [None])[0]
@@ -338,6 +342,8 @@ class Handler(BaseHTTPRequestHandler):
                 state = "cancelled" if job["state"] == "queued" or job["hold"] else "cancelling"
                 db.execute("UPDATE jobs SET state=?,ended=?,state_note=? WHERE id=?",
                            (state, now if state == "cancelled" else None, data.get("reason", ""), job["id"]))
+                if state == "cancelled":
+                    model.revoke_diagnostic(db, job["id"], now, data.get("reason", "cancelled"))
             elif action == "move":
                 if job["state"] != "queued":
                     raise APIError(409, "only queued jobs can move")
@@ -370,6 +376,9 @@ class Handler(BaseHTTPRequestHandler):
             elif action == "preempt":
                 if job["state"] not in ("running", "preempting") or not job["leaseable"] or job["hold"]:
                     raise APIError(409, "job cannot be preempted")
+                if db.execute("SELECT 1 FROM diagnostic_grants WHERE job_id=?",
+                              (job["id"],)).fetchone():
+                    raise APIError(409, "diagnostic cannot be preempted")
                 db.execute("UPDATE jobs SET state='preempting' WHERE id=?", (job["id"],))
             else:
                 if not job["hold"]:
@@ -414,12 +423,30 @@ class Handler(BaseHTTPRequestHandler):
             if node is None:
                 raise APIError(404, "node not found")
             action = parts[2]
+            if action == "diagnostic":
+                if (set(data) - {"job_id", "reason"}
+                        or type(data.get("job_id")) is not int or data["job_id"] <= 0
+                        or not isinstance(data.get("reason"), str) or not data["reason"].strip()):
+                    raise APIError(400, "diagnostic requires a positive job_id and nonempty reason")
+                job = self.get_job(db, data["job_id"])
+                try:
+                    grant = model.authorize_diagnostic(
+                        db, node, job, identity["principal"], data["reason"], now)
+                except ValueError as exc:
+                    raise APIError(409, str(exc)) from exc
+                detail.update(node=parts[1], attempt=0)
+                return grant, "diagnostic_authorize", job["id"], detail
             if action not in ("approve", "disable", "clear-fault"):
                 raise APIError(404, "not found")
             if action == "approve" and node["status"] not in ("pending", "disabled"):
                 raise APIError(409, "node must be pending or disabled")
             if action == "clear-fault" and node["status"] != "faulted":
                 raise APIError(409, "node is not faulted")
+            if action != "disable" and db.execute("""SELECT 1 FROM diagnostic_grants g
+                    JOIN jobs j ON j.id=g.job_id WHERE g.node=? AND g.revoked IS NULL
+                    AND (g.consumed IS NULL OR j.state IN ('running','preempting','cancelling'))""",
+                    (parts[1],)).fetchone():
+                raise APIError(409, "node has a pending or running diagnostic")
             model.set_node_status(db, parts[1], "disabled" if action == "disable" else "active")
             detail["node"] = parts[1]
             return {"status": "disabled" if action == "disable" else "active"}, "node_" + action, None, detail
@@ -445,6 +472,11 @@ class Handler(BaseHTTPRequestHandler):
                 if job["state"] == "cancelling":
                     note = "cancelled; lost on node"
                     db.execute("""UPDATE jobs SET state='cancelled',ended=?,state_note=?
+                        WHERE id=?""", (now, note, job["id"]))
+                elif db.execute("""SELECT 1 FROM diagnostic_grants
+                        WHERE job_id=? AND consumed IS NOT NULL""", (job["id"],)).fetchone():
+                    note = "diagnostic lost on node; no retry"
+                    db.execute("""UPDATE jobs SET state='failed',ended=?,state_note=?
                         WHERE id=?""", (now, note, job["id"]))
                 else:
                     db.execute("""UPDATE jobs SET state='queued',attempt=attempt+1,

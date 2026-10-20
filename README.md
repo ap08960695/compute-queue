@@ -66,3 +66,25 @@ independent legacy launchers.
 ```bash
 python3 -m unittest discover -s tests
 ```
+
+### One-job diagnostic on a disabled node
+
+An Owner may authorize one already-queued, exact-node job without opening the
+node's general queue:
+
+```sh
+cq node diagnostic ai JOB_ID --reason "One approved regression; no retry"
+```
+
+The job must be attempt 0, executable, never previously started, and the node must
+have no allocations. The scheduler atomically consumes the durable grant when it
+starts that job. Other jobs, including CPU jobs, stay queued. The node stays
+disabled after completion, failure, or refusal. Exit 6 and a lost diagnostic
+allocation fail without requeueing. Cancelling a pending job revokes its grant.
+Only an Owner can create or inspect grants (`GET /nodes/NAME/diagnostic`);
+operators cannot use this route to enable a node.
+
+On Linux, a newly observed kernel fault remains latched in the agent's
+`KERNEL-FAULT.json` across restarts. It blocks subsequent GPU launches and stops
+owned GPU allocations; it never stops an outside process. This file is evidence
+for explicit recovery review, not an automatically cleared retry flag.

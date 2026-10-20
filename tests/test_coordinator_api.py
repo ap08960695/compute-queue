@@ -92,6 +92,242 @@ class CoordinatorAPI(unittest.TestCase):
         with closing(model.connect(self.server.db_path)) as db:
             return [dict(r) for r in db.execute(sql, params)]
 
+    def test_diagnostic_grants_only_exact_job_without_enabling_node(self):
+        self.post("/nodes/ai/disable")
+        cpu = self.submit(node_pref="ai")
+        any_cpu = self.submit()
+        other_gpu = self.submit(node_pref="ai", gpu=True)
+        target = self.submit(node_pref="ai", gpu=True, vram_req=3*GB)
+        self.assertEqual(self.heartbeat()["start"], [])
+        grant = self.post("/nodes/ai/diagnostic",
+                          {"job_id": target, "reason": "D4 one shot"})
+        self.assertEqual((grant["job_id"], grant["node"], grant["principal"]),
+                         (target, "ai", "owner"))
+        self.assertIsNone(grant["consumed"])
+        start = self.heartbeat()["start"]
+        self.assertEqual([j["id"] for j in start], [target])
+        self.assertEqual((start[0]["attempt"], start[0]["effective_ram"],
+                          start[0]["effective_vram"]), (0, 1.3*GB, 3.5*GB))
+        self.assertEqual(self.heartbeat()["start"], [])
+        self.assertEqual(self.report(target, 0)["state"], "done")
+        self.assertEqual(self.heartbeat()["start"], [])
+        self.assertTrue(all(self.job(j)["state"] == "queued"
+                            for j in (cpu, any_cpu, other_gpu)))
+        status, nodes = self.request("GET", "/nodes")
+        self.assertEqual(status, 200)
+        self.assertEqual(nodes["nodes"][0]["status"], "disabled")
+        status, grants = self.request("GET", "/nodes/ai/diagnostic")
+        self.assertEqual(status, 200)
+        self.assertEqual(grants["grants"][0]["consumed"], self.now)
+        audits = self.rows("SELECT * FROM audit WHERE job_id=? AND action LIKE 'diagnostic_%'",
+                           (target,))
+        self.assertEqual([a["action"] for a in audits],
+                         ["diagnostic_authorize", "diagnostic_consume"])
+        self.assertEqual(json.loads(audits[0]["detail"])["reason"], "D4 one shot")
+
+    def test_diagnostic_authorization_requires_owner_and_exact_fresh_idle_job(self):
+        target = self.submit(node_pref="ai")
+        body = {"job_id": target, "reason": "D4"}
+        self.post("/nodes/ai/diagnostic", body, status=409)  # active
+        self.post("/nodes/ai/disable")
+        for who, expected in (("ops", 403), ("alice", 403), ("bob", 403),
+                              ("ai", 403), (None, 401)):
+            with self.subTest(who=who):
+                self.post("/nodes/ai/diagnostic", body, who, status=expected)
+                self.assertEqual(self.request("GET", "/nodes/ai/diagnostic", who=who)[0],
+                                 expected)
+        for invalid in (True, 1.5, str(target), -1, 0, None):
+            with self.subTest(job_id=invalid):
+                self.post("/nodes/ai/diagnostic", dict(body, job_id=invalid), status=400)
+        for invalid in ("", " ", None):
+            self.post("/nodes/ai/diagnostic", dict(body, reason=invalid), status=400)
+        self.post("/nodes/ai/diagnostic", {"job_id": target}, status=400)
+        self.post("/nodes/ai/diagnostic", dict(body, wildcard=True), status=400)
+        self.post("/nodes/missing/diagnostic", body, status=404)
+        self.post("/nodes/ai/diagnostic", dict(body, job_id=99999), status=404)
+        for values in ({"node_pref": "any"}, {"node_pref": "mac"},
+                       {"hold": True, "argv": []}, {"argv": []}):
+            invalid_job = self.submit(**dict({"node_pref": "ai"}, **values))
+            self.post("/nodes/ai/diagnostic", dict(body, job_id=invalid_job), status=409)
+        cancelled = self.submit(node_pref="ai")
+        self.post(f"/jobs/{cancelled}/cancel")
+        self.post("/nodes/ai/diagnostic", dict(body, job_id=cancelled), status=409)
+        # No rejected request may have minted a grant or authorization audit.
+        self.assertEqual(self.request("GET", "/nodes/ai/diagnostic")[1], {"grants": []})
+        self.assertEqual(self.rows("SELECT * FROM audit WHERE action='diagnostic_authorize'"), [])
+        self.heartbeat(allocs=[{"job_id": 99999, "attempt": 0}])
+        self.post("/nodes/ai/diagnostic", body, status=409)
+        self.heartbeat()
+        self.post("/nodes/ai/approve")
+        self.heartbeat()
+        self.post("/nodes/ai/disable")
+        self.post("/nodes/ai/diagnostic", body, status=409)  # current allocation
+        self.report(target, 6)
+        self.assertEqual(self.job(target)["attempt"], 1)
+        self.post("/nodes/ai/diagnostic", body, status=409)  # queued retry
+
+    def test_diagnostic_finish_refusal_fault_and_preemption_never_retry(self):
+        self.post("/nodes/ai/disable")
+        cpu = self.submit(node_pref="ai")
+        for rc, fault, expected in ((0, None, "done"), (1, "refused", "failed"),
+                                    (6, None, "failed"), (6, "GPU fault", "failed"),
+                                    (0, "GPU fault", "failed")):
+            with self.subTest(rc=rc, fault=fault):
+                target = self.submit(node_pref="ai", gpu=True)
+                body = {"job_id": target, "reason": "one shot"}
+                self.post("/nodes/ai/diagnostic", body)
+                self.assertEqual([j["id"] for j in self.heartbeat()["start"]], [target])
+                result = self.report(target, rc, fault=fault)
+                self.assertEqual((result["state"], result["attempt"]), (expected, 0))
+                self.assertEqual(result["ended"], self.now)
+                self.assertEqual(self.request("GET", "/nodes")[1]["nodes"][0]["status"], "disabled")
+                self.assertEqual(self.heartbeat()["start"], [])
+                self.post("/nodes/ai/diagnostic", body, status=409)
+                self.post("/agent/report", {"job_id": target, "attempt": 0, "rc": 0},
+                          "ai", status=409)
+        self.assertEqual(self.job(cpu)["state"], "queued")
+
+    def test_diagnostic_lost_allocation_fails_without_retry(self):
+        self.post("/nodes/ai/disable")
+        target = self.submit(node_pref="ai")
+        body = {"job_id": target, "reason": "D4"}
+        self.post("/nodes/ai/diagnostic", body)
+        self.heartbeat()
+        self.now += 61
+        self.assertEqual(self.heartbeat()["start"], [])
+        job = self.job(target)
+        self.assertEqual((job["state"], job["attempt"], job["state_note"]),
+                         ("failed", 0, "diagnostic lost on node; no retry"))
+        self.assertEqual(self.request("GET", "/nodes")[1]["nodes"][0]["status"], "disabled")
+        self.post("/nodes/ai/diagnostic", body, status=409)
+        # An explicit later activation must not resurrect the diagnostic.
+        self.post("/nodes/ai/approve")
+        self.assertEqual(self.heartbeat()["start"], [])
+
+    def test_diagnostic_pending_and_running_cannot_enable_node_or_authorize_another(self):
+        self.post("/nodes/ai/disable")
+        target = self.submit(node_pref="ai")
+        other = self.submit(node_pref="ai")
+        body = {"job_id": target, "reason": "D4"}
+        self.post("/nodes/ai/diagnostic", body)
+        for stage in ("pending", "running"):
+            with self.subTest(stage=stage):
+                self.post("/nodes/ai/approve", status=409)
+                self.post("/nodes/ai/diagnostic", body, status=409)
+                self.post("/nodes/ai/diagnostic", dict(body, job_id=other), status=409)
+                self.assertEqual(self.request("GET", "/nodes")[1]["nodes"][0]["status"], "disabled")
+            if stage == "pending":
+                self.assertEqual([j["id"] for j in self.heartbeat()["start"]], [target])
+        self.report(target, 0)
+        self.post("/nodes/ai/diagnostic", dict(body, job_id=other))
+        self.assertEqual([j["id"] for j in self.heartbeat()["start"]], [other])
+
+    def test_diagnostic_cancel_pending_revokes_grant_and_cannot_reauthorize_id(self):
+        self.post("/nodes/ai/disable")
+        target = self.submit(node_pref="ai")
+        body = {"job_id": target, "reason": "D4"}
+        self.post("/nodes/ai/diagnostic", body)
+        self.post(f"/jobs/{target}/cancel", {"reason": "authorization outcome uncertain"})
+        self.assertEqual(self.heartbeat()["start"], [])
+        grant = self.request("GET", "/nodes/ai/diagnostic")[1]["grants"][0]
+        self.assertIsNone(grant["consumed"])
+        self.assertEqual(grant["revoked"], self.now)
+        self.post("/nodes/ai/diagnostic", body, status=409)
+        other = self.submit(node_pref="ai")
+        self.post("/nodes/ai/diagnostic", dict(body, job_id=other))
+        self.assertEqual([j["id"] for j in self.heartbeat()["start"]], [other])
+
+    def test_diagnostic_cannot_be_preempted_even_if_job_is_leaseable(self):
+        self.post("/nodes/ai/disable")
+        target = self.submit(node_pref="ai", gpu=True, leaseable=True)
+        self.post("/nodes/ai/diagnostic", {"job_id": target, "reason": "D4"})
+        self.heartbeat()
+        for who in ("owner", "ops"):
+            self.post(f"/jobs/{target}/preempt", {"reason": "urgent work"},
+                      who, status=409)
+        urgent = self.submit(who="owner", node_pref="ai", gpu=True, urgent=True)
+        plan = self.heartbeat(allocs=[{"job_id": target, "attempt": 0}])
+        self.assertEqual(plan, {"start": [], "preempt": [], "cancel": []})
+        self.assertEqual(self.job(target)["state"], "running")
+        self.assertEqual(self.job(urgent)["state"], "queued")
+        self.post(f"/jobs/{target}/cancel", {"reason": "stop diagnostic"})
+        self.assertEqual(self.report(target, 6)["state"], "cancelled")
+        self.assertEqual(self.heartbeat()["start"], [])
+
+    def test_diagnostic_rechecks_capacity_dependencies_and_observed_allocations(self):
+        self.post("/nodes/ai/disable")
+        dep = self.submit(node_pref="mac", hold=True, argv=[])
+        target = self.submit(node_pref="ai", gpu=True, vram_req=3*GB, deps=[dep])
+        self.post("/nodes/ai/diagnostic", {"job_id": target, "reason": "D4"})
+        self.assertEqual(self.heartbeat()["start"], [])
+        self.post(f"/jobs/{dep}/finish")
+        for stats in ({"mem_available": 0}, {"vram_used": 19*GB},
+                      {"outside_gpu_busy": True},
+                      {"allocs": [{"job_id": 9999, "attempt": 0}]}):
+            self.assertEqual(self.heartbeat(**stats)["start"], [])
+            self.assertIsNone(self.request("GET", "/nodes/ai/diagnostic")[1]["grants"][0]["consumed"])
+        self.assertEqual([j["id"] for j in self.heartbeat()["start"]], [target])
+
+    def test_diagnostic_concurrent_authorization_and_heartbeats_are_one_shot(self):
+        self.post("/nodes/ai/disable")
+        target = self.submit(node_pref="ai")
+        body = {"job_id": target, "reason": "D4"}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            responses = list(pool.map(
+                lambda _: self.request("POST", "/nodes/ai/diagnostic", body), range(4)))
+        self.assertEqual(sorted(r[0] for r in responses), [200, 409, 409, 409])
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda _: self.heartbeat(), range(4)))
+        self.assertEqual([j["id"] for p in results for j in p["start"]], [target])
+        self.assertEqual(len(self.rows(
+            "SELECT * FROM audit WHERE action='diagnostic_consume' AND job_id=?", (target,))), 1)
+
+    def test_diagnostic_grant_consumption_and_start_roll_back_together(self):
+        self.post("/nodes/ai/disable")
+        target = self.submit(node_pref="ai")
+        self.post("/nodes/ai/diagnostic", {"job_id": target, "reason": "D4"})
+        with closing(model.connect(self.server.db_path)) as db:
+            db.executescript("""CREATE TRIGGER reject_start BEFORE UPDATE OF state ON jobs
+                WHEN NEW.state='running' BEGIN SELECT RAISE(ABORT, 'test storage failure'); END;""")
+        self.post("/agent/heartbeat", {"stats": {"mem_available": 60*GB}}, "ai", status=409)
+        self.assertEqual(self.job(target)["state"], "queued")
+        self.assertIsNone(self.request("GET", "/nodes/ai/diagnostic")[1]["grants"][0]["consumed"])
+        self.assertEqual(self.rows("SELECT * FROM audit WHERE action='diagnostic_consume'"), [])
+        with closing(model.connect(self.server.db_path)) as db:
+            db.execute("DROP TRIGGER reject_start")
+        self.assertEqual([j["id"] for j in self.heartbeat()["start"]], [target])
+
+    def test_diagnostic_rejects_non_disabled_nodes_retry_jobs_and_live_db_allocations(self):
+        retry = self.submit(node_pref="ai", gpu=True)
+        self.heartbeat()
+        self.report(retry, 6)
+        self.post("/nodes/ai/disable")
+        self.post("/nodes/ai/diagnostic", {"job_id": retry, "reason": "D4"}, status=409)
+        self.post(f"/jobs/{retry}/cancel")
+        target = self.submit(node_pref="ai")
+        body = {"job_id": target, "reason": "D4"}
+        for status in ("pending", "faulted"):
+            with closing(model.connect(self.server.db_path)) as db, db:
+                model.set_node_status(db, "ai", status)
+            self.post("/nodes/ai/diagnostic", body, status=409)
+        self.post("/nodes/ai/disable")
+        for state in model.ACTIVE:
+            with closing(model.connect(self.server.db_path)) as db, db:
+                db.execute("UPDATE jobs SET state=?,node='ai' WHERE id=?", (state, retry))
+            self.post("/nodes/ai/diagnostic", body, status=409)
+
+    def test_diagnostic_failed_dependency_revokes_without_start(self):
+        self.post("/nodes/ai/disable")
+        dep = self.submit(node_pref="mac")
+        target = self.submit(node_pref="ai", deps=[dep])
+        self.post("/nodes/ai/diagnostic", {"job_id": target, "reason": "D4"})
+        self.post(f"/jobs/{dep}/cancel")
+        self.assertEqual(self.heartbeat()["start"], [])
+        self.assertEqual(self.job(target)["state"], "blocked")
+        grant = self.request("GET", "/nodes/ai/diagnostic")[1]["grants"][0]
+        self.assertIsNone(grant["consumed"])
+        self.assertEqual(grant["revoked"], self.now)
+
     def test_submit_list_show_and_auth(self):
         job_id = self.submit(note="a job", cwd="/tmp", env={"X": "1"})
         job = self.job(job_id)
@@ -658,6 +894,51 @@ with open(sys.argv[1], 'a+') as stream:
 
 
 class StoragePermissions(unittest.TestCase):
+    def test_diagnostic_migration_and_restart_preserve_disabled_one_shot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "queue.sqlite3"
+            with closing(model.connect(path)) as db, db:
+                # An existing pre-diagnostic database has no grant table/index.
+                db.execute("DROP TABLE diagnostic_grants")
+                model.register_node(db, "ai", "linux", {"ram_total": 64*GB},
+                                    status="disabled")
+                token = add_token(db, "owner", "owner")
+                target = model.create_job(db, "owner", argv=["true"], node_pref="ai")
+                ordinary = model.create_job(db, "owner", argv=["true"], node_pref="ai")
+                model.record_heartbeat(db, "ai", {"mem_available": 60*GB}, 100)
+                db.execute("""INSERT INTO audit(at,principal,action,job_id,detail)
+                    VALUES (100,'owner','submit',?,'{}')""", (target,))
+            path.chmod(0o666)
+            with closing(model.connect(path)) as db, db:
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 2)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM audit").fetchone()[0], 1)
+                self.assertEqual(db.execute("SELECT hash FROM tokens").fetchone()[0],
+                                 hashlib.sha256(token.encode()).hexdigest())
+                node = db.execute("SELECT * FROM nodes WHERE name='ai'").fetchone()
+                job = model.job_dict(db.execute("SELECT * FROM jobs WHERE id=?", (target,)).fetchone())
+                model.authorize_diagnostic(db, node, job, "owner", "D4", 101)
+            # Restart before consumption retains only the exact pending grant.
+            with closing(model.connect(path)) as db, db:
+                db.execute("BEGIN IMMEDIATE")
+                self.assertEqual([j["id"] for j in model.plan_for_node(db, "ai", 102)["start"]],
+                                 [target])
+                self.assertEqual(db.execute("SELECT status FROM nodes").fetchone()[0], "disabled")
+            # Restart after consumption cannot issue a second start.
+            with closing(model.connect(path)) as db, db:
+                db.execute("BEGIN IMMEDIATE")
+                self.assertEqual(model.plan_for_node(db, "ai", 103)["start"], [])
+                model.report(db, target, 6, {}, 1, 104, fault="refused")
+            with closing(model.connect(path)) as db, db:
+                db.execute("BEGIN IMMEDIATE")
+                self.assertEqual(model.plan_for_node(db, "ai", 105)["start"], [])
+                self.assertEqual(db.execute("SELECT status FROM nodes").fetchone()[0], "disabled")
+                self.assertEqual(db.execute("SELECT state FROM jobs WHERE id=?", (target,)).fetchone()[0],
+                                 "failed")
+                self.assertEqual(db.execute("SELECT state FROM jobs WHERE id=?", (ordinary,)).fetchone()[0],
+                                 "queued")
+                self.assertEqual(db.execute("SELECT consumed FROM diagnostic_grants").fetchone()[0], 102)
+
     def test_every_start_and_connection_tightens_existing_modes(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"

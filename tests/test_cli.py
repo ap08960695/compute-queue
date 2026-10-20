@@ -129,6 +129,14 @@ class CliTests(unittest.TestCase):
             self.invoke(main, ["ls"])
         self.assertEqual(self.server.requests[-1][3], "Bearer operator-token")
 
+    def test_diagnostic_posts_exact_id_and_prints_json_receipt(self):
+        output = self.invoke(main, ["node", "diagnostic", "ai", "7",
+                                    "--reason", "D4 one shot"])
+        self.assertEqual(self.server.requests, [
+            ("POST", "/nodes/ai/diagnostic", {"job_id": 7, "reason": "D4 one shot"},
+             "Bearer test-token")])
+        self.assertEqual(json.loads(output), {"ok": True, "job_id": 7, "reason": "D4 one shot"})
+
     def test_missing_selected_token_never_falls_back_to_owner(self):
         with mock.patch.dict(os.environ, {"CQ_CONFIG_DIR": str(self.home / "missing")}), \
                 contextlib.redirect_stderr(io.StringIO()):

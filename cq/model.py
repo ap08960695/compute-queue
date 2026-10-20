@@ -50,6 +50,15 @@ CREATE TABLE IF NOT EXISTS audit (
     principal TEXT NOT NULL, action TEXT NOT NULL, job_id INTEGER,
     detail TEXT NOT NULL
 );
+-- Additive migration: existing queues retain all jobs, tokens and node states.
+CREATE TABLE IF NOT EXISTS diagnostic_grants (
+    job_id INTEGER PRIMARY KEY REFERENCES jobs(id),
+    node TEXT NOT NULL REFERENCES nodes(name),
+    principal TEXT NOT NULL, reason TEXT NOT NULL,
+    created REAL NOT NULL, consumed REAL, revoked REAL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS diagnostic_pending_node
+    ON diagnostic_grants(node) WHERE consumed IS NULL AND revoked IS NULL;
 """
 
 
@@ -222,17 +231,56 @@ def effective(db, job):
     return ram, vram + 0.5e9, est
 
 
+def authorize_diagnostic(db, node, job, principal, reason, now):
+    """Create one durable grant in the caller's write transaction.
+
+    The authenticated coordinator must check owner permissions first.
+    """
+    if node["status"] != "disabled":
+        raise ValueError("diagnostic requires a disabled node")
+    if (job["node_pref"] != node["name"] or job["state"] != "queued"
+            or job["attempt"] != 0 or job["node"] is not None
+            or job["started"] is not None or job["hold"] or not job["argv"]):
+        raise ValueError("diagnostic requires an exact-node queued executable job at attempt 0")
+    if json.loads(node["stats"]).get("allocs") or db.execute(
+            "SELECT 1 FROM jobs WHERE node=? AND state IN (?,?,?)",
+            (node["name"], *ACTIVE)).fetchone():
+        raise ValueError("diagnostic requires no current allocations")
+    db.execute("""INSERT INTO diagnostic_grants
+        (job_id,node,principal,reason,created) VALUES (?,?,?,?,?)""",
+        (job["id"], node["name"], principal, reason, now))
+    return dict(db.execute("SELECT * FROM diagnostic_grants WHERE job_id=?",
+                           (job["id"],)).fetchone())
+
+
+def revoke_diagnostic(db, job_id, now, reason):
+    if db.execute("""UPDATE diagnostic_grants SET revoked=?
+            WHERE job_id=? AND consumed IS NULL AND revoked IS NULL""",
+            (now, job_id)).rowcount:
+        db.execute("""INSERT INTO audit(at,principal,action,job_id,detail)
+            VALUES (?,?,?,?,?)""", (now, "coordinator", "diagnostic_revoke", job_id,
+                                    json.dumps({"reason": reason})))
+
+
 def plan_for_node(db, node_name, now):
-    """Apply starts and blocks; request cooperative preemption."""
+    """Apply starts and blocks in the caller's write transaction."""
     result = {"start": [], "preempt": [], "blocked": []}
     node = db.execute("SELECT * FROM nodes WHERE name=?", (node_name,)).fetchone()
-    if node is None or node["status"] != "active":
+    if node is None or node["status"] not in ("active", "disabled"):
+        return result
+    diagnostic = node["status"] == "disabled"
+    grant = db.execute("""SELECT * FROM diagnostic_grants
+        WHERE node=? AND consumed IS NULL AND revoked IS NULL""",
+        (node_name,)).fetchone() if diagnostic else None
+    if diagnostic and grant is None:
         return result
     stats = json.loads(node["stats"])
     observed = {(a["job_id"], a.get("attempt", 0)): a for a in stats.get("allocs", [])}
     running = [job_dict(r) for r in db.execute(
         "SELECT * FROM jobs WHERE node=? AND state IN (?,?,?)",
         (node_name, *ACTIVE))]
+    if diagnostic and (running or observed):
+        return result
     sizes = {j["id"]: effective(db, j) for j in running}
     growth = sum(max(0, sizes[j["id"]][0] - observed.get((j["id"], j["attempt"]), {}).get(
         "current_ram", 0)) for j in running)
@@ -244,6 +292,9 @@ def plan_for_node(db, node_name, now):
     queue = [job_dict(r) for r in db.execute("""SELECT * FROM jobs
         WHERE state='queued' AND node_pref IN (?, 'any')
         ORDER BY urgent DESC, priority DESC, position ASC, id ASC""", (node_name,))]
+    if diagnostic:
+        queue = [j for j in queue if j["id"] == grant["job_id"]
+                 and j["node_pref"] == node_name and j["attempt"] == 0]
     head = None
     for job in queue:
         deps = [db.execute("SELECT state FROM jobs WHERE id=?", (dep,)).fetchone()
@@ -253,6 +304,7 @@ def plan_for_node(db, node_name, now):
         if bad is not None:
             db.execute("UPDATE jobs SET state='blocked',state_note=?,ended=? WHERE id=?",
                        (f"dependency {bad}", now, job["id"]))
+            revoke_diagnostic(db, job["id"], now, f"dependency {bad}")
             result["blocked"].append(job["id"])
             continue
         if any(row is None or row["state"] != "done" for row in deps):
@@ -270,6 +322,14 @@ def plan_for_node(db, node_name, now):
                            and ram_free - ram >= effective(db, head)[0])
             if not (backfill or independent):
                 continue
+        if diagnostic:
+            if not db.execute("""UPDATE diagnostic_grants SET consumed=?
+                    WHERE job_id=? AND consumed IS NULL AND revoked IS NULL""",
+                    (now, job["id"])).rowcount:
+                return result
+            db.execute("""INSERT INTO audit(at,principal,action,job_id,detail)
+                VALUES (?,?,?,?,?)""", (now, "coordinator", "diagnostic_consume", job["id"],
+                json.dumps({"node": node_name, "attempt": 0, "reason": grant["reason"]})))
         db.execute("""UPDATE jobs SET state='running',node=?,started=?,ended=NULL,
             state_note='' WHERE id=?""", (node_name, now, job["id"]))
         job.update(state="running", node=node_name, started=now, ended=None,
@@ -316,21 +376,30 @@ def report(db, job_id, rc, peaks, wall_s, now, fault=None, cancelled=False):
         raise ValueError("invalid report")
     peaks = {k: number(peaks.get(k, 0), k) for k in ("peak_ram", "peak_vram")}
     number(wall_s, "wall_s")
+    diagnostic = db.execute("""SELECT 1 FROM diagnostic_grants
+        WHERE job_id=? AND consumed IS NOT NULL""", (job_id,)).fetchone() is not None
     cancelled = job["state"] == "cancelling"
     state = "cancelled" if cancelled else "done" if rc == 0 else "queued" if rc == 6 else "failed"
+    if diagnostic and not cancelled:
+        state = "done" if rc == 0 and not fault else "failed"
+    note = "cancelled by request" if cancelled else str(fault or "")
+    if diagnostic and state == "failed" and not note:
+        note = "diagnostic failed; no retry"
     db.execute("""UPDATE jobs SET state=?,rc=?,peaks=?,ended=?,
         attempt=attempt+?,node=?,started=?,state_note=? WHERE id=?""",
         (state, rc, json.dumps(peaks), None if state == "queued" else now,
          int(state == "queued"), None if state == "queued" else job["node"],
          None if state == "queued" else job["started"],
-         "cancelled by request" if cancelled else str(fault or ""), job_id))
-    if rc in (0, 6) and not cancelled:
+         note, job_id))
+    if rc in (0, 6) and not cancelled and (not diagnostic or state == "done"):
         row = db.execute("SELECT runs FROM profiles WHERE kind=?", (job["kind"],)).fetchone()
         runs = json.loads(row["runs"]) if row else []
         runs.append(dict(peaks, wall_s=wall_s, at=now))
         db.execute("INSERT OR REPLACE INTO profiles(kind,runs) VALUES (?,?)",
                    (job["kind"], json.dumps(runs[-5:])))
-    if fault and job["node"]:
+    if diagnostic:
+        set_node_status(db, job["node"], "disabled")
+    elif fault and job["node"]:
         set_node_status(db, job["node"], "faulted")
 
 

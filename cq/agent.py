@@ -229,7 +229,12 @@ def mac_runner(sdir, argv, lock_path=None):
                 os.close(fd)
     if child is not None:
         term_at, killed = None, False
-        while group_running(host, child) is not False:
+        # ps enumerates PIDs before reading their state. A parent may fork and
+        # exit during that snapshot, leaving a live child outside its PID list.
+        # Confirm an empty group with a fresh enumeration while retaining the
+        # unreaped leader/PGID reservation and the GPU lock.
+        while (group_running(host, child) is not False
+               or group_running(host, child) is not False):
             if os.path.exists(f"{sdir}/stop"):
                 try:
                     if term_at is None:
@@ -266,6 +271,7 @@ class Agent:
         self.journal_ok = True
         self.kernel_cursor = None
         self.kernel_scan_at = None
+        self.kernel_fault_latched = os.path.exists(f"{spool}/KERNEL-FAULT.json")
         os.makedirs(f"{spool}/signals", exist_ok=True)
         os.makedirs(f"{spool}/logs", exist_ok=True)
         saved = json.loads(read(f"{spool}/allocs.json") or "[]")
@@ -283,7 +289,7 @@ class Agent:
             log.info("reattached %s", sorted(self.allocs))
         self.gpu_node = not self.mac and drm_sum(sysfs, "mem_info_vram_total") > 0
         if self.gpu_node:
-            self.kernel_faults(force=True)  # baseline: faults before agent start are ignored
+            self.kernel_faults(force=True, baseline=True)  # only initial historical snapshot is baseline
 
     # -- coordinator transport -------------------------------------------------
 
@@ -387,7 +393,7 @@ class Agent:
         busy = max([read_int(p) for p in glob.glob(
             f"{self.sysfs}/class/drm/card[0-9]*/device/gpu_busy_percent")] or [0])
         return {"mem_available": self.mem_available(), "vram_used": vram,
-                "outside_gpu_busy": bool((not self.mac and not self.journal_ok) or
+                "outside_gpu_busy": bool((not self.mac and (not self.journal_ok or self.kernel_fault_latched)) or
                                          (not own_gpu and (busy >= 50 or self.gpu_lock_held())))}
 
     def gpu_lock_held(self):
@@ -438,7 +444,7 @@ class Agent:
                 total += int(float(m.group(1)) * UNITS[m.group(2)])
         return total
 
-    def kernel_faults(self, force=False):
+    def kernel_faults(self, force=False, baseline=False):
         """Fault lines logged since the previous scan, or None when no scan ran (journalctl
         unavailable, or under KERNEL_SCAN_S since the last one). Reads only new lines."""
         if not self.journal_ok:
@@ -455,11 +461,18 @@ class Agent:
             return None
         self.kernel_scan_at = t
         n = 0
+        faults = []
         for ln in out.splitlines():
             if ln.startswith("-- cursor: "):
                 self.kernel_cursor = ln[len("-- cursor: "):].strip()
             elif FAULT_RE.search(ln):
                 n += 1
+                faults.append(ln)
+        if n and not baseline:
+            self.kernel_fault_latched = True
+            self.write(f"{self.spool}/KERNEL-FAULT.json", json.dumps(
+                {"at": t, "cursor": self.kernel_cursor, "lines": faults,
+                 "policy": "new fault; manual review required; no automatic retry"}))
         return n
 
     # -- allocations ---------------------------------------------------------------
@@ -472,9 +485,9 @@ class Agent:
         attempt = int(spec.get("attempt") or 0)
         if not self.mac and spec.get("gpu"):
             self.kernel_faults(force=True)  # admission must not rely on stale telemetry
-            if not self.journal_ok:
+            if not self.journal_ok or self.kernel_fault_latched:
                 self.report(jid, LAUNCH_FAILED_RC, {"peak_ram": 0, "peak_vram": 0},
-                            0, attempt, fault="telemetry")
+                            0, attempt, fault="kernel" if self.kernel_fault_latched else "telemetry")
                 return
         try:
             ram = int(spec.get("effective_ram") or 0)
@@ -678,7 +691,7 @@ class Agent:
             n = self.kernel_faults()
             if not self.journal_ok:
                 fault = "telemetry"
-            elif n:
+            elif n or self.kernel_fault_latched:
                 fault = "kernel"
         if fault:
             for a in gpu:
@@ -703,7 +716,7 @@ class Agent:
         for a in list(self.allocs.values()):
             self.poll(a, stats["vram_used"])
         self.guards(stats["vram_used"])
-        if not self.mac and not self.journal_ok:
+        if not self.mac and (not self.journal_ok or self.kernel_fault_latched):
             stats["outside_gpu_busy"] = True
         if not self.flush_outbox():
             log.warning("coordinator unreachable; reports queued, starting nothing")

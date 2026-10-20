@@ -789,6 +789,27 @@ class GuardTests(Base):
         a.tick()
         self.assertTrue(self.coord.heartbeats()[-1]["stats"]["outside_gpu_busy"])
 
+    def test_new_idle_fault_stays_blocking_after_cursor_consumed_and_restart(self):
+        a = self.mk(gpu=True)
+        self.host.journal = (0, 'amdgpu REG_WAIT timeout\n')
+        self.clock[0] += 60
+        self.assertTrue(a.stats()['outside_gpu_busy'])
+        self.clock[0] += 60
+        self.assertTrue(a.stats()['outside_gpu_busy'])
+        a = self.mk(gpu=True)
+        self.start_job(a, gpu=True)
+        a.tick()
+        self.assertFalse(any(c[0] == 'systemd-run' for c in self.host.cmds))
+        self.assertEqual([r['fault'] for r in self.coord.reports()], ['kernel'])
+
+    def test_new_fault_during_start_refuses_before_spawn(self):
+        a = self.mk(gpu=True)
+        self.host.journal = (0, 'amdgpu REG_WAIT timeout\n')
+        self.start_job(a, gpu=True)
+        a.tick()
+        self.assertFalse(any(c[0] == 'systemd-run' for c in self.host.cmds))
+        self.assertEqual([r['fault'] for r in self.coord.reports()], ['kernel'])
+
     def test_gpu_admission_checks_telemetry_even_inside_scan_interval(self):
         a = self.mk(gpu=True)
         self.host.journal = (1, "permission denied")

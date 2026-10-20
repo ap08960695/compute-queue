@@ -221,6 +221,10 @@ def _make_parser():
     for name in ("invite", "approve", "disable", "clear-fault"):
         command = node_sub.add_parser(name)
         command.add_argument("name")
+    diagnostic = node_sub.add_parser("diagnostic", help="authorize exactly one job on a disabled node (owner only)")
+    diagnostic.add_argument("name")
+    diagnostic.add_argument("job_id", type=int)
+    diagnostic.add_argument("--reason", required=True)
     profile = sub.add_parser("profile")
     profile_sub = profile.add_subparsers(dest="profile_command", required=True)
     profile_sub.add_parser("ls")
@@ -289,6 +293,11 @@ def main(argv=None):
             elif args.node_command == "invite":
                 payload = api.request("POST", "/nodes/invite", {"name": args.name})
                 print(payload.get("code", ""))
+            elif args.node_command == "diagnostic":
+                payload = api.request(
+                    "POST", f"/nodes/{urllib.parse.quote(args.name, safe='')}/diagnostic",
+                    {"job_id": args.job_id, "reason": args.reason})
+                print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             else:
                 endpoint = {"approve": "approve", "disable": "disable",
                             "clear-fault": "clear-fault"}[args.node_command]
