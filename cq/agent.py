@@ -22,6 +22,7 @@ DROP_CODES = (400, 404, 409)  # a report the Coordinator will never accept
 KILL_GRACE_S = 20
 VRAM_CAP = 19.5e9
 LAUNCH_FAILED_RC = 125
+KERNEL_SCAN_S = 60  # minimum seconds between kernel log scans
 FAULT_RE = re.compile(r"amdgpu.*(page fault|reset|timeout|hang)|HSA_STATUS_ERROR|oom-kill", re.I)
 UNITS = {"B": 1, "KB": 2**10, "MB": 2**20, "GB": 2**30}
 
@@ -131,7 +132,8 @@ class Agent:
         self.vram_cap = cfg.get("vram_cap", VRAM_CAP)
         self.procs = {}  # job_id -> Popen, only for children started by this agent process
         self.journal_ok = True
-        self.kernel_seen = 0
+        self.kernel_cursor = None
+        self.kernel_scan_at = None
         os.makedirs(f"{spool}/signals", exist_ok=True)
         os.makedirs(f"{spool}/logs", exist_ok=True)
         saved = json.loads(read(f"{spool}/allocs.json") or "[]")
@@ -143,7 +145,7 @@ class Agent:
             log.info("reattached %s", sorted(self.allocs))
         self.gpu_node = not self.mac and drm_sum(sysfs, "mem_info_vram_total") > 0
         if self.gpu_node:
-            self.kernel_seen = self.kernel_faults() or 0
+            self.kernel_faults(force=True)  # baseline: faults before agent start are ignored
 
     # -- coordinator transport -------------------------------------------------
 
@@ -283,16 +285,29 @@ class Agent:
                 total += int(float(m.group(1)) * UNITS[m.group(2)])
         return total
 
-    def kernel_faults(self):
-        """Count of fault lines in the kernel log, or None when journalctl is unavailable."""
+    def kernel_faults(self, force=False):
+        """Fault lines logged since the previous scan, or None when no scan ran (journalctl
+        unavailable, or under KERNEL_SCAN_S since the last one). Reads only new lines."""
         if not self.journal_ok:
             return None
-        rc, out = self.host.run(["sudo", "-n", "journalctl", "-k", "-b", "--no-pager"], timeout=60)
+        t = self.now()
+        if not force and self.kernel_scan_at is not None and t - self.kernel_scan_at < KERNEL_SCAN_S:
+            return None
+        argv = ["sudo", "-n", "journalctl", "-k", "--no-pager", "--show-cursor"]
+        argv += [f"--after-cursor={self.kernel_cursor}"] if self.kernel_cursor else ["-b"]
+        rc, out = self.host.run(argv, timeout=60)
         if rc != 0:
             self.journal_ok = False
             log.warning("kernel log guard disabled: sudo -n journalctl -k failed (rc=%s)", rc)
             return None
-        return sum(1 for ln in out.splitlines() if FAULT_RE.search(ln))
+        self.kernel_scan_at = t
+        n = 0
+        for ln in out.splitlines():
+            if ln.startswith("-- cursor: "):
+                self.kernel_cursor = ln[len("-- cursor: "):].strip()
+            elif FAULT_RE.search(ln):
+                n += 1
+        return n
 
     # -- allocations ---------------------------------------------------------------
 
@@ -465,10 +480,8 @@ class Agent:
             fault = "vram"
         else:
             n = self.kernel_faults()
-            if n is not None and n > self.kernel_seen:
+            if n:
                 fault = "kernel"
-            if n is not None:
-                self.kernel_seen = n
         if fault:
             for a in gpu:
                 self.terminate(a, fault)

@@ -70,7 +70,13 @@ class FakeHost:
                 self.listed.discard(argv[-1])
             return 0, ""
         if c == "sudo":
-            return self.journal
+            rc, text = self.journal
+            if rc != 0:
+                return rc, text
+            lines = text.splitlines()
+            after = [a for a in argv if a.startswith("--after-cursor=")]
+            start = int(after[0].split("=s=")[1]) if after else 0
+            return 0, "".join(f"{ln}\n" for ln in lines[start:]) + f"-- cursor: s={len(lines)}\n"
         if c == "sysctl":
             vals = {"kern.memorystatus_vm_pressure_level": f"{self.pressure}\n",
                     "hw.memsize": "17179869184\n", "machdep.cpu.brand_string": "Apple M2\n"}
@@ -667,21 +673,54 @@ class GuardTests(Base):
         a = self.mk(gpu=True)
         self.start_job(a, gpu=True)
         self.host.journal = (0, "kernel: amdgpu 0000:03:00.0: GPU reset begin!\n")
+        self.clock[0] += 60
         a.tick()
         self.assertEqual(self.host.systemctl("stop"), ["cq-job-7-a0.service"])
         a.tick()
         self.assertEqual(self.coord.reports()[0]["fault"], "kernel")
-        self.assertIn(["sudo", "-n", "journalctl", "-k", "-b", "--no-pager"], self.host.cmds)
+        self.assertIn(["sudo", "-n", "journalctl", "-k", "--no-pager", "--show-cursor", "-b"],
+                      self.host.cmds)
 
     def test_kernel_lines_from_before_agent_start_are_ignored(self):
         self.host.journal = (0, "kernel: amdgpu: page fault old\nkernel: oom-kill:constraint=x\n")
         a = self.mk(gpu=True)
         self.start_job(a, gpu=True)
+        self.clock[0] += 60
         a.tick()
         self.assertEqual(self.host.systemctl("stop"), [])
         self.host.journal = (0, self.host.journal[1] + "HSA_STATUS_ERROR_EXCEPTION\n")
+        self.clock[0] += 60
         a.tick()
         self.assertEqual(self.host.systemctl("stop"), ["cq-job-7-a0.service"])
+
+    def test_kernel_log_scanned_at_most_every_60s_and_incrementally(self):
+        a = self.mk(gpu=True)
+        self.start_job(a, gpu=True)
+        sudo = lambda: [c for c in self.host.cmds if c[0] == "sudo"]
+        self.assertEqual(len(sudo()), 1)  # baseline at start
+        self.host.journal = (0, "kernel: amdgpu: page fault new\n")
+        for _ in range(5):  # ticks inside the interval do not touch the journal
+            self.clock[0] += 10
+            a.tick()
+        self.assertEqual(len(sudo()), 1)
+        self.assertEqual(self.host.systemctl("stop"), [])
+        self.clock[0] += 10  # 60 s since baseline
+        a.tick()
+        self.assertEqual(len(sudo()), 2)
+        self.assertEqual(self.host.systemctl("stop"), ["cq-job-7-a0.service"])
+
+    def test_kernel_scan_reads_only_lines_since_previous_scan(self):
+        self.host.journal = (0, "kernel: boot line\n")
+        a = self.mk(gpu=True)
+        self.assertNotIn("--after-cursor=s=1", " ".join(self.host.cmds[0]))
+        self.assertEqual(a.kernel_faults(force=True), 0)
+        self.assertIn("--after-cursor=s=1", self.host.cmds[-1])
+        self.assertNotIn("-b", self.host.cmds[-1])
+        self.host.journal = (0, "kernel: boot line\nkernel: oom-kill:constraint=x\n")
+        self.clock[0] += 60
+        self.assertEqual(a.kernel_faults(), 1)
+        self.clock[0] += 60
+        self.assertEqual(a.kernel_faults(), 0)  # the old fault line is not counted again
 
     def test_kernel_guard_skipped_without_sudo(self):
         self.host.journal = (1, "sudo: a password is required")

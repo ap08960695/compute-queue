@@ -235,6 +235,14 @@ class CliTests(unittest.TestCase):
         paths = [path for _method, path, _body, _auth in self.server.requests]
         self.assertEqual(paths[-2:], ["/jobs", "/nodes"])
 
+    def test_computeboard_mac_book_holds_the_gpu(self):
+        out = self.invoke(computeboard_main, ["book", "mac", "alice", "--eta", "30m"])
+        self.assertRegex(out, r"^booked #44 mac ")
+        body = self.server.requests[-1][2]
+        self.assertEqual(body["node_pref"], "mac")
+        self.assertTrue(body["gpu"])
+        self.assertTrue(body["hold"])
+
     def test_computeboard_start_never_sets_urgent(self):
         out = self.invoke(computeboard_main, ["start", "7"])
         self.assertEqual(out, "#7 -> queued")

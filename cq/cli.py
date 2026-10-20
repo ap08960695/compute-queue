@@ -512,7 +512,7 @@ def computeboard_main(argv=None):
             payload = {
                 "argv": [],
                 "node_pref": "ai" if args.resource == "gpu" else "mac",
-                "gpu": args.resource == "gpu",
+                "gpu": True,  # the Mac has one GPU: two Mac bookings must not overlap
                 "ram_req": 0,
                 "vram_req": 0,
                 "priority": 0,
