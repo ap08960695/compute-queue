@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -94,8 +95,8 @@ def parse_size(value):
         result = float(number) * units[unit]
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid size: {value}") from exc
-    if result < 0:
-        raise argparse.ArgumentTypeError("size must be non-negative")
+    if not math.isfinite(result) or result < 0:
+        raise argparse.ArgumentTypeError("size must be finite and non-negative")
     return int(result)
 
 
@@ -186,6 +187,8 @@ def _make_parser():
     submit.add_argument("--node", default="any")
     submit.add_argument("--gpu", action="store_true")
     submit.add_argument("--ram", type=parse_size)
+    submit.add_argument("--ram-floor", type=parse_size, default=0)
+    submit.add_argument("--ram-start-min", type=parse_size, default=0)
     submit.add_argument("--vram", type=parse_size, default=0)
     submit.add_argument("--priority", type=int, default=0)
     submit.add_argument("--kind", default="")
@@ -259,6 +262,11 @@ def main(argv=None):
                 "cwd": args.cwd,
                 "env": _env_pairs(args.env),
             }
+            # Preserve the legacy request for jobs that opt out of these checks.
+            if args.ram_floor:
+                payload["ram_floor"] = args.ram_floor
+            if args.ram_start_min:
+                payload["ram_start_min"] = args.ram_start_min
             print(f"submitted #{_id(api.request('POST', '/jobs', payload))}")
         elif command == "ls":
             jobs = _items(api.request("GET", "/jobs"), "jobs")

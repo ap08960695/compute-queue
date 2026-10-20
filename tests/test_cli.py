@@ -137,6 +137,21 @@ class CliTests(unittest.TestCase):
              "Bearer test-token")])
         self.assertEqual(json.loads(output), {"ok": True, "job_id": 7, "reason": "D4 one shot"})
 
+    def test_ram_admission_submit_size_flags_and_invalid_values(self):
+        self.invoke(main, ["submit", "--ram", "5G", "--ram-floor", "12G",
+                           "--ram-start-min", "19G", "--", "true"])
+        body = self.server.requests[-1][2]
+        self.assertEqual((body["ram_floor"], body["ram_start_min"]), (12*2**30, 19*2**30))
+        for flag in ("--ram-floor", "--ram-start-min"):
+            for value in ("-1", "nan", "inf", "1e309G", "invalid"):
+                with self.subTest(flag=flag, value=value), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    count = len(self.server.requests)
+                    with self.assertRaises(SystemExit) as error:
+                        main(["submit", "--ram", "1G", flag, value, "--", "true"])
+                    self.assertEqual(error.exception.code, 2)
+                    self.assertEqual(len(self.server.requests), count)
+
     def test_missing_selected_token_never_falls_back_to_owner(self):
         with mock.patch.dict(os.environ, {"CQ_CONFIG_DIR": str(self.home / "missing")}), \
                 contextlib.redirect_stderr(io.StringIO()):

@@ -92,6 +92,31 @@ class CoordinatorAPI(unittest.TestCase):
         with closing(model.connect(self.server.db_path)) as db:
             return [dict(r) for r in db.execute(sql, params)]
 
+    def test_ram_admission_api_validates_persists_and_forwards_constraints(self):
+        for field in ("ram_floor", "ram_start_min"):
+            for value in (-1, True, None, "19G", float("nan"), float("inf"), -float("inf")):
+                with self.subTest(field=field, value=value):
+                    self.post("/jobs", {"ram_req": GB, field: value}, status=400)
+        target = self.submit(ram_floor=12*2**30, ram_start_min=19*2**30)
+        job = self.job(target)
+        self.assertEqual((job["ram_floor"], job["ram_start_min"]), (12*2**30, 19*2**30))
+        start = self.heartbeat()["start"][0]
+        self.assertEqual((start["ram_floor"], start["ram_start_min"], start["effective_ram_floor"]),
+                         (12*2**30, 19*2**30, 12*2**30))
+        ordinary = self.submit()
+        self.assertEqual((self.job(ordinary)["ram_floor"], self.job(ordinary)["ram_start_min"]), (0, 0))
+
+    def test_ram_admission_diagnostic_grant_waits_for_both_thresholds(self):
+        self.post("/nodes/ai/disable")
+        target = self.submit(node_pref="ai", ram_req=5*2**30,
+                             ram_floor=12*2**30, ram_start_min=19*2**30)
+        self.post("/nodes/ai/diagnostic", {"job_id": target, "reason": "Phase B"})
+        for available in (18*2**30, 18.9*2**30):
+            self.assertEqual(self.heartbeat(mem_available=available)["start"], [])
+            self.assertIsNone(self.request("GET", "/nodes/ai/diagnostic")[1]["grants"][0]["consumed"])
+        self.assertEqual([j["id"] for j in self.heartbeat(mem_available=19*2**30)["start"]], [target])
+        self.assertEqual(self.request("GET", "/nodes")[1]["nodes"][0]["status"], "disabled")
+
     def test_diagnostic_grants_only_exact_job_without_enabling_node(self):
         self.post("/nodes/ai/disable")
         cpu = self.submit(node_pref="ai")
@@ -894,6 +919,38 @@ with open(sys.argv[1], 'a+') as stream:
 
 
 class StoragePermissions(unittest.TestCase):
+    def test_ram_admission_migrates_populated_old_database_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "old.sqlite3"
+            with closing(model.connect(path)) as db, db:
+                model.register_node(db, "ai", "linux", {"ram_total": 64*GB}, status="disabled")
+                target = model.create_job(db, "owner", argv=["true"], node_pref="ai")
+                token = add_token(db, "owner", "owner")
+                db.execute("""INSERT INTO diagnostic_grants
+                    (job_id,node,principal,reason,created) VALUES (?,'ai','owner','D4',100)""",
+                    (target,))
+                columns = {r["name"] for r in db.execute("PRAGMA table_info(jobs)")}
+                for column in ("ram_floor", "ram_start_min"):
+                    if column in columns:
+                        db.execute(f"ALTER TABLE jobs DROP COLUMN {column}")
+            # Concurrent first opens must serialize ALTER TABLE and preserve old rows.
+            def reopen(_):
+                with closing(model.connect(path)) as db:
+                    row = model.job_dict(db.execute("SELECT * FROM jobs").fetchone())
+                    return row["id"], row["ram_floor"], row["ram_start_min"]
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                self.assertEqual(list(pool.map(reopen, range(4))), [(target, 0, 0)] * 4)
+            with closing(model.connect(path)) as db, db:
+                self.assertEqual(db.execute("SELECT status FROM nodes").fetchone()[0], "disabled")
+                self.assertIsNone(db.execute("SELECT consumed FROM diagnostic_grants").fetchone()[0])
+                self.assertEqual(db.execute("SELECT hash FROM tokens").fetchone()[0],
+                                 hashlib.sha256(token.encode()).hexdigest())
+                new = model.create_job(db, "owner", argv=["true"], ram_floor=12*GB, ram_start_min=19*GB)
+            with closing(model.connect(path)) as db:
+                row = db.execute("SELECT * FROM jobs WHERE id=?", (new,)).fetchone()
+                self.assertEqual((row["ram_floor"], row["ram_start_min"]), (12*GB, 19*GB))
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
     def test_diagnostic_migration_and_restart_preserve_disabled_one_shot(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "queue.sqlite3"

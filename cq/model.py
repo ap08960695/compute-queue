@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS jobs (
                        'done','failed','blocked','cancelled')),
     node TEXT, attempt INTEGER NOT NULL DEFAULT 0, rc INTEGER,
     peaks TEXT NOT NULL DEFAULT '{}', created REAL NOT NULL,
-    started REAL, ended REAL, state_note TEXT NOT NULL DEFAULT ''
+    started REAL, ended REAL, state_note TEXT NOT NULL DEFAULT '',
+    ram_floor REAL NOT NULL DEFAULT 0, ram_start_min REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, node_pref);
 CREATE TABLE IF NOT EXISTS profiles (kind TEXT PRIMARY KEY, runs TEXT NOT NULL);
@@ -80,6 +81,13 @@ def connect(path):
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA foreign_keys=ON")
         db.executescript(SCHEMA)
+        # Serialize discovery and ALTER for concurrent opens of an older queue.
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            columns = {r["name"] for r in db.execute("PRAGMA table_info(jobs)")}
+            for column in ("ram_floor", "ram_start_min"):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE jobs ADD COLUMN {column} REAL NOT NULL DEFAULT 0")
         secure_files()
     except Exception:
         db.close()
@@ -172,7 +180,7 @@ def record_heartbeat(db, name, stats, now):
 def create_job(db, submitter, argv=(), node_pref="any", gpu=False, ram_req=0,
                vram_req=0, priority=0, kind="", note="", deps=(),
                leaseable=False, est_s=None, urgent=False, hold=False,
-               hold_until=None, cwd="", env=None, now=0):
+               hold_until=None, cwd="", env=None, now=0, ram_floor=0, ram_start_min=0):
     for key, value in (("submitter", submitter), ("node_pref", node_pref),
                        ("kind", kind), ("note", note), ("cwd", cwd)):
         if not isinstance(value, str):
@@ -193,7 +201,8 @@ def create_job(db, submitter, argv=(), node_pref="any", gpu=False, ram_req=0,
                        ("urgent", urgent), ("hold", hold)):
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be boolean")
-    for key, value in (("ram_req", ram_req), ("vram_req", vram_req)):
+    for key, value in (("ram_req", ram_req), ("vram_req", vram_req),
+                       ("ram_floor", ram_floor), ("ram_start_min", ram_start_min)):
         number(value, key)
     number(est_s, "est_s", nullable=True)
     number(hold_until, "hold_until", nullable=True)
@@ -209,11 +218,12 @@ def create_job(db, submitter, argv=(), node_pref="any", gpu=False, ram_req=0,
     position = db.execute("SELECT COALESCE(MAX(position),0)+1 FROM jobs").fetchone()[0]
     cur = db.execute("""INSERT INTO jobs
         (submitter,kind,note,argv,cwd,env,node_pref,gpu,ram_req,vram_req,
-         priority,position,deps,leaseable,est_s,urgent,hold,hold_until,state,created)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?)""",
+         priority,position,deps,leaseable,est_s,urgent,hold,hold_until,state,created,
+         ram_floor,ram_start_min)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?)""",
         (submitter, kind, note, json.dumps(argv), cwd, json.dumps(env), node_pref,
          gpu, ram_req, vram_req, priority, position, json.dumps(deps), leaseable,
-         est_s, urgent, hold, hold_until, now))
+         est_s, urgent, hold, hold_until, now, ram_floor, ram_start_min))
     return cur.lastrowid
 
 
@@ -284,7 +294,10 @@ def plan_for_node(db, node_name, now):
     sizes = {j["id"]: effective(db, j) for j in running}
     growth = sum(max(0, sizes[j["id"]][0] - observed.get((j["id"], j["attempt"]), {}).get(
         "current_ram", 0)) for j in running)
-    ram_free = stats.get("mem_available", 0) - node["ram_floor"] - growth
+    ram_available = stats.get("mem_available", 0) - growth
+    running_floors = {j["id"]: j["ram_floor"] for j in running}
+    planned_floor = node["ram_floor"]
+    ram_floor = max([planned_floor, *running_floors.values()])
     vram_free = node["vram_cap"] - stats.get("vram_used", 0)
     gpu_free = not stats.get("outside_gpu_busy", False) and not any(
         j["gpu"] for j in running)
@@ -310,7 +323,9 @@ def plan_for_node(db, node_name, now):
         if any(row is None or row["state"] != "done" for row in deps):
             continue
         ram, vram, est = effective(db, job)
-        fits = ram <= ram_free and (not job["gpu"] or gpu_free and vram <= vram_free)
+        job_floor = max(ram_floor, job["ram_floor"])
+        fits = (ram_available >= max(job_floor + ram, job["ram_start_min"])
+                and (not job["gpu"] or gpu_free and vram <= vram_free))
         if not fits:
             if head is None:
                 head = job
@@ -319,7 +334,9 @@ def plan_for_node(db, node_name, now):
             backfill = job["leaseable"] or est is not None and est <= 1800
             # SPEC step 6(b): preserve the head's GPU slot and RAM headroom.
             independent = (not (job["gpu"] and head["gpu"])
-                           and ram_free - ram >= effective(db, head)[0])
+                           and ram_available - ram >= max(
+                               max(job_floor, head["ram_floor"]) + effective(db, head)[0],
+                               head["ram_start_min"]))
             if not (backfill or independent):
                 continue
         if diagnostic:
@@ -333,10 +350,13 @@ def plan_for_node(db, node_name, now):
         db.execute("""UPDATE jobs SET state='running',node=?,started=?,ended=NULL,
             state_note='' WHERE id=?""", (node_name, now, job["id"]))
         job.update(state="running", node=node_name, started=now, ended=None,
-                   state_note="", effective_ram=ram, effective_vram=vram, est_s=est)
+                   state_note="", effective_ram=ram, effective_vram=vram, est_s=est,
+                   effective_ram_floor=job_floor)
         if not job["hold"]:
             result["start"].append(job)
-        ram_free -= ram
+        ram_available -= ram
+        planned_floor = max(planned_floor, job["ram_floor"])
+        ram_floor = job_floor
         if job["gpu"]:
             gpu_free = False
             gpu_count += 1
@@ -352,12 +372,14 @@ def plan_for_node(db, node_name, now):
     candidates.sort(key=lambda j: (j["urgent"], j["priority"], j["id"]))
     ram, vram, _ = effective(db, head)
     for job in candidates:
-        if ram <= ram_free and (not head["gpu"] or (
+        projected_floor = max(planned_floor, head["ram_floor"], *running_floors.values())
+        if ram_available >= max(projected_floor + ram, head["ram_start_min"]) and (not head["gpu"] or (
                 gpu_count == 0 and not stats.get("outside_gpu_busy", False)
                 and vram <= vram_free)):
             break
-        ram_free += max(sizes[job["id"]][0],
-                        observed.get((job["id"], job["attempt"]), {}).get("current_ram", 0))
+        ram_available += max(sizes[job["id"]][0],
+                             observed.get((job["id"], job["attempt"]), {}).get("current_ram", 0))
+        running_floors.pop(job["id"], None)
         if job["gpu"]:
             gpu_count -= 1
             vram_free += observed.get((job["id"], job["attempt"]), {}).get("current_vram", 0)

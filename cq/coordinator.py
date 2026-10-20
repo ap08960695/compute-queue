@@ -316,7 +316,7 @@ class Handler(BaseHTTPRequestHandler):
             self.require(identity, "submit")
             keys = {"argv", "node_pref", "gpu", "ram_req", "vram_req", "priority",
                     "kind", "note", "deps", "leaseable", "est_s", "urgent", "hold",
-                    "hold_until", "cwd", "env"}
+                    "hold_until", "cwd", "env", "ram_floor", "ram_start_min"}
             if set(data) - keys - {"reason"}:
                 raise APIError(400, "unknown job fields")
             if data.get("urgent", False):

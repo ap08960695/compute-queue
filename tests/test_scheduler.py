@@ -55,6 +55,79 @@ class Base(unittest.TestCase):
         return [j['id'] for j in self.plan(node, now)['start']]
 
 
+class RamAdmissionTest(Base):
+    def test_floor_and_start_min_are_independent_inclusive_thresholds(self):
+        self.node(avail=19*GiB, floor=4*GiB)
+        job = self.job(ram_req=5*GiB, ram_floor=12*GiB, ram_start_min=20*GiB)
+        self.assertEqual(self.started(), [])
+        self.beat(avail=20*GiB)
+        self.assertEqual(self.started(), [job])
+        self.assertEqual((self.row(job)["ram_floor"], self.row(job)["ram_start_min"]),
+                         (12*GiB, 20*GiB))
+
+    def test_job_floor_is_left_after_effective_ram_and_node_floor_cannot_be_lowered(self):
+        self.node(avail=18*GiB, floor=12*GiB)
+        job = self.job(ram_req=5*GiB, ram_floor=1*GiB)
+        self.assertEqual(self.started(), [])
+        self.beat(avail=18.5*GiB)
+        self.assertEqual(self.started(), [job])
+
+    def test_all_running_floors_survive_later_jobs_and_planned_allocations(self):
+        self.node(avail=20*GiB, floor=4*GiB)
+        high_floor = self.job(ram_req=5*GiB, ram_floor=12*GiB)
+        later = self.job(ram_req=2*GiB)
+        self.assertEqual(self.started(), [high_floor])
+        # Even a fully observed allocation keeps its requested floor reserved.
+        self.beat(avail=14*GiB, allocs=[{"job_id": high_floor, "current_ram": 6.5*GiB}])
+        self.assertEqual(self.started(), [])
+        self.beat(avail=14.6*GiB, allocs=[{"job_id": high_floor, "current_ram": 6.5*GiB}])
+        self.assertEqual(self.started(), [later])
+
+    def test_start_min_deducts_jobs_planned_in_same_heartbeat(self):
+        self.node(avail=20*GiB)
+        first = self.job(ram_req=5*GiB)
+        second = self.job(ram_req=GiB, ram_start_min=19*GiB)
+        self.assertEqual(self.started(), [first])
+        self.assertEqual(self.row(second)["state"], "queued")
+
+    def test_independent_backfill_preserves_heads_floor_and_start_min(self):
+        for constraints in ({"ram_floor": 18*GiB}, {"ram_start_min": 20*GiB}):
+            with self.subTest(constraints=constraints):
+                self.db.execute("DELETE FROM jobs")
+                if not self.db.execute("SELECT 1 FROM nodes").fetchone():
+                    self.node(avail=20*GiB, outside=True)
+                head = self.job(gpu=True, ram_req=GiB, **constraints)
+                tail = self.job(ram_req=2*GiB, est_s=7200)
+                self.assertEqual(self.started(), [])
+                self.assertEqual(self.row(head)["state"], "queued")
+                self.assertEqual(self.row(tail)["state"], "queued")
+
+    def test_preemption_reclaims_floor_only_in_projection_until_job_finishes(self):
+        self.node(avail=25*GiB)
+        high_floor = self.job(ram_req=GiB, ram_floor=20*GiB, leaseable=True)
+        other = self.job(ram_req=GiB, leaseable=True)
+        self.assertEqual(self.started(), [high_floor, other])
+        self.beat(avail=10*GiB, allocs=[
+            {"job_id": high_floor, "current_ram": 1.3*GiB},
+            {"job_id": other, "current_ram": 1.3*GiB}])
+        head = self.job(ram_req=2*GiB, urgent=True)
+        self.assertEqual(self.plan()["preempt"], [high_floor])
+        self.assertEqual(self.started(), [])
+        model.report(self.db, high_floor, 6, {}, 1, 1)
+        self.assertEqual(self.started(), [head])
+
+    def test_preemption_considers_head_start_min(self):
+        self.node(avail=25*GiB)
+        first = self.job(ram_req=2*GiB, leaseable=True)
+        second = self.job(ram_req=2*GiB, leaseable=True)
+        self.started()
+        self.beat(avail=10*GiB, allocs=[
+            {"job_id": first, "current_ram": 2.6*GiB},
+            {"job_id": second, "current_ram": 2.6*GiB}])
+        self.job(ram_req=GiB, urgent=True, ram_start_min=15*GiB)
+        self.assertEqual(self.plan()["preempt"], [first, second])
+
+
 class QueueOrderTest(Base):
     def test_order_urgent_priority_position_id(self):
         self.node()

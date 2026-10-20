@@ -67,6 +67,36 @@ independent legacy launchers.
 python3 -m unittest discover -s tests
 ```
 
+### Per-job RAM admission
+
+`cq submit --ram-floor 8G --ram-start-min 19G` adds optional RAM admission
+constraints to an ordinary job. Both sizes use binary units (`G` = GiB).
+The corresponding `POST /jobs` fields are `ram_floor` and `ram_start_min`,
+in bytes, defaulting to zero. Both must be finite nonnegative numbers.
+Existing SQLite queues are migrated additively with zero defaults.
+
+`ram_floor` is the MemAvailable reserve required **after** accounting for the
+job's effective RAM cap. The scheduler uses the maximum of the node floor,
+the candidate's floor, and the floors of all active allocations (including holds,
+preempting and cancelling jobs). It reserves pending growth and jobs planned in
+the same heartbeat. Backfill preserves these floors; preemption only projects
+released resources, and does not permit starts until allocations actually finish.
+
+`ram_start_min` is an absolute prelaunch MemAvailable threshold, in addition to
+the floor plus effective RAM requirement. Scheduling tests it against available
+RAM after reservations, without subtracting the floor a second time. A start
+spec includes `effective_ram_floor`, the combined floor for that allocation.
+For jobs opting in with either nonzero constraint, the agent samples RAM again
+before launching and checks both thresholds using that combined floor. Low RAM,
+invalid constraints, or missing/invalid telemetry produce launch-failed rc 125
+without starting the workload. Jobs with both constraints zero retain legacy
+agent behavior.
+
+These fields do not implement a stability timer. A controller requiring
+MemAvailable >= 19 GiB continuously for 300 seconds must enforce that before
+submission. Diagnostic admission still uses the exact queued job ID and keeps
+the node disabled; its grant is consumed only once the RAM constraints fit.
+
 ### One-job diagnostic on a disabled node
 
 An Owner may authorize one already-queued, exact-node job without opening the

@@ -210,6 +210,103 @@ class Base(unittest.TestCase):
         a.tick()
 
 
+class RamAdmissionTests(Base):
+    def available(self, amount):
+        (self.t / "proc/meminfo").write_text(f"MemAvailable: {amount // 1024} kB\n")
+
+    def spec(self, **extra):
+        return {"id": 7, "attempt": 0, "argv": ["true"], "effective_ram": 6*GIB, **extra}
+
+    def assert_refused(self, a):
+        before = len(self.coord.reports())
+        self.assertTrue(a.flush_outbox())
+        self.assertEqual(len(self.coord.reports()), before + 1)
+        self.assertEqual(self.coord.reports()[-1]["rc"], agent.LAUNCH_FAILED_RC)
+        self.assertEqual(a.allocs, {})
+        self.assertEqual(a.intents, {})
+        self.assertFalse(any(c[0] == "systemd-run" for c in self.host.cmds))
+        self.assertEqual(self.host.spawned, [])
+
+    def test_ram_admission_low_floor_or_start_min_refuses_before_launch(self):
+        a = self.mk()
+        for constraints, available in (
+                ({"ram_floor": 12*GIB}, 17*GIB),
+                ({"ram_start_min": 19*GIB}, 18*GIB),
+                ({"ram_floor": GIB, "effective_ram_floor": 12*GIB}, 17*GIB)):
+            with self.subTest(constraints=constraints):
+                self.available(available)
+                a.start(self.spec(**constraints))
+                self.assert_refused(a)
+
+    def test_ram_admission_refreshes_after_heartbeat_and_accepts_exact_boundary(self):
+        a = self.mk()
+        self.available(20*GIB)
+        self.assertEqual(a.stats()["mem_available"], 20*GIB)
+        self.available(18*GIB)
+        spec = self.spec(ram_floor=12*GIB, ram_start_min=19*GIB)
+        a.start(spec)
+        self.assert_refused(a)
+        # A different authorized job, not a retry of the refused allocation.
+        self.available(19*GIB)
+        a.start(dict(spec, id=8, effective_ram=7*GIB))
+        self.assertEqual(list(a.allocs), [8])
+        self.assertEqual(len([c for c in self.host.cmds if c[0] == "systemd-run"]), 1)
+
+    def test_ram_admission_missing_or_malformed_linux_telemetry_refuses(self):
+        a = self.mk()
+        path = self.t / "proc/meminfo"
+        for text in ("", "MemAvailable: NaN kB\n", "MemAvailable: -1 kB\n",
+                     "MemAvailable: 90000000 MB\n"):
+            with self.subTest(text=text):
+                path.write_text(text)
+                a.start(self.spec(ram_start_min=1))
+                self.assert_refused(a)
+        path.unlink()
+        a.start(self.spec(ram_floor=1))
+        self.assert_refused(a)
+
+    def test_ram_admission_default_zero_keeps_legacy_launch_behavior(self):
+        a = self.mk()
+        (self.t / "proc/meminfo").unlink()
+        a.start(self.spec(ram_floor=0, ram_start_min=0, effective_ram_floor=100*GIB))
+        self.assertEqual(list(a.allocs), [7])
+        self.assertEqual(self.coord.reports(), [])
+
+    def test_ram_admission_invalid_constraints_refuse_without_spawn(self):
+        a = self.mk()
+        self.available(20*GIB)
+        for field in ("ram_floor", "ram_start_min"):
+            for value in (-1, float("nan"), float("inf"), True, "12G", None):
+                with self.subTest(field=field, value=value):
+                    a.start(self.spec(**{field: value}))
+                    self.assert_refused(a)
+
+    def test_ram_admission_validates_effective_floor_only_for_opted_in_jobs(self):
+        a = self.mk()
+        self.available(20*GIB)
+        for value in (-1, float("nan"), float("inf"), True, "12G", None):
+            with self.subTest(value=value):
+                a.start(self.spec(ram_start_min=19*GIB, effective_ram_floor=value))
+                self.assert_refused(a)
+        a.start(self.spec(id=8, effective_ram_floor=None))
+        self.assertEqual(list(a.allocs), [8])
+
+    def test_ram_admission_mac_low_or_invalid_telemetry_never_spawns(self):
+        a = self.mk(os_name="darwin")
+        a.start(self.spec(ram_start_min=19*GIB))
+        self.assert_refused(a)
+        original = self.host.run
+        for telemetry in ((1, "Pages free: 999999999\n"),
+                          (0, "invalid vm_stat"),
+                          (0, "page size of 16384 bytes\nPages free: 999999999\n")):
+            with self.subTest(telemetry=telemetry), mock.patch.object(
+                    self.host, "run",
+                    side_effect=lambda argv, timeout=30: telemetry if argv == ["vm_stat"]
+                    else original(argv, timeout)):
+                a.start(self.spec(effective_ram=1, ram_floor=1))
+                self.assert_refused(a)
+
+
 class LinuxTests(Base):
     def test_main_exit_keeps_allocation_until_nested_cgroup_drains(self):
         a = self.mk()

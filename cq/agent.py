@@ -5,6 +5,7 @@ import fcntl
 import glob
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -376,14 +377,43 @@ class Agent:
 
     # -- sampling ----------------------------------------------------------------
 
-    def mem_available(self):
+    def mem_available(self, strict=False):
         if not self.mac:
+            if strict:
+                match = re.search(r"^MemAvailable:[ \t]+(\d+)[ \t]+kB[ \t]*$",
+                                  read(f"{self.proc}/meminfo"), re.M)
+                if match is None:
+                    raise ValueError("invalid MemAvailable telemetry")
+                return int(match.group(1)) * 1024
             return meminfo(self.proc, "MemAvailable")
-        out = self.host.run(["vm_stat"])[1]
+        rc, out = self.host.run(["vm_stat"])
         ps = re.search(r"page size of (\d+) bytes", out)
+        if strict:
+            counts = [re.search(rf"^Pages {name}:[ \t]+(\d+)\.?[ \t]*$", out, re.M)
+                      for name in ("free", "inactive", "speculative")]
+            if rc != 0 or ps is None or int(ps.group(1)) <= 0 or not all(counts):
+                raise ValueError("invalid vm_stat telemetry")
+            return sum(int(m.group(1)) for m in counts) * int(ps.group(1))
         pages = sum(int(m.group(1)) for m in re.finditer(
             r"^Pages (?:free|inactive|speculative):\s+(\d+)", out, re.M))
         return pages * int(ps.group(1) if ps else 16384)
+
+    def check_ram_admission(self, spec, ram):
+        """Fresh, fail-closed admission for jobs requesting RAM constraints."""
+        def valid(value, name):
+            if (type(value) not in (int, float) or not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and nonnegative")
+            return value
+
+        floor = valid(spec.get("ram_floor", 0), "ram_floor")
+        start_min = valid(spec.get("ram_start_min", 0), "ram_start_min")
+        if floor == 0 and start_min == 0:
+            return
+        floor = max(floor, valid(spec.get("effective_ram_floor", floor), "effective_ram_floor"))
+        available = valid(self.mem_available(strict=True), "MemAvailable")
+        if available < start_min or available - ram < floor:
+            raise ValueError(f"RAM admission refused: MemAvailable={available}, "
+                             f"ram_start_min={start_min}, effective_ram={ram}, ram_floor={floor}")
 
     def stats(self):
         vram = 0 if self.mac else drm_sum(self.sysfs, "mem_info_vram_used")
@@ -499,6 +529,7 @@ class Agent:
             a = {"job_id": jid, "attempt": attempt, "gpu": bool(spec.get("gpu")), "cap": ram, "signal_dir": sdir,
                  "started": self.now(), "current_ram": 0, "current_vram": 0, "peak_ram": 0, "peak_vram": 0}
             argv = list(spec["argv"])
+            self.check_ram_admission(spec, ram)
             if self.mac:
                 a["mac_runner"] = True
                 self.intents[jid] = {**a, "state": "launching"}
