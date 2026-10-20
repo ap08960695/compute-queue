@@ -168,7 +168,8 @@ class CoordinatorAPI(unittest.TestCase):
 
     def test_invite_register_approve_and_node_isolation(self):
         self.post("/nodes/invite", {"name": "mac"}, "alice", status=403)
-        code = self.post("/nodes/invite", {"name": "mac"}, "ops")["code"]
+        self.post("/nodes/invite", {"name": "mac"}, "ops", status=403)
+        code = self.post("/nodes/invite", {"name": "mac"})["code"]
         data = {"name": "mac", "code": code, "hw": {"os": "darwin", "ram_total": 64*GB}}
         status, registration = self.request("POST", "/nodes/register", data, who=None)
         self.assertEqual(status, 200, registration)
@@ -177,7 +178,8 @@ class CoordinatorAPI(unittest.TestCase):
         self.assertEqual(self.heartbeat("mac")["start"], [])
         self.assertEqual(self.rows("SELECT status FROM nodes WHERE name='mac'")[0]["status"], "pending")
         self.assertEqual(self.request("POST", "/nodes/register", data, who=None)[0], 403)
-        self.post("/nodes/mac/approve", {}, "ops")
+        self.post("/nodes/mac/approve", {}, "ops", status=403)
+        self.post("/nodes/mac/approve", {})
         self.assertEqual([j["id"] for j in self.heartbeat("mac")["start"]], [queued])
         self.post("/agent/report", {"job_id": queued, "attempt": 0, "rc": 0}, "ai", status=409)
         self.post("/agent/heartbeat", {"stats": {}}, "owner", status=403)
@@ -202,9 +204,12 @@ class CoordinatorAPI(unittest.TestCase):
         second = self.submit(gpu=True)
         self.assertEqual(self.heartbeat()["start"], [])
         self.post("/nodes/ai/approve", {}, status=409)
-        self.post("/nodes/ai/clear-fault", {}, "ops")
+        self.post("/nodes/ai/clear-fault", {}, "ops", status=403)
+        self.assertEqual(self.heartbeat()["start"], [])
+        self.post("/nodes/ai/clear-fault", {})
         self.assertEqual(self.heartbeat()["start"][0]["id"], second)
-        self.post("/nodes/ai/disable", {}, "ops")
+        self.post("/nodes/ai/disable", {}, "ops", status=403)
+        self.post("/nodes/ai/disable", {})
         self.submit()
         self.assertEqual(self.heartbeat()["start"], [])
 

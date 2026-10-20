@@ -119,6 +119,22 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 0)
         return output.getvalue().strip()
 
+    def test_selected_profile_uses_its_token_and_coordinator(self):
+        profile = self.home / "profiles" / "operator"
+        profile.mkdir(parents=True)
+        (profile / "token").write_text("operator-token")
+        (profile / "token").chmod(0o600)
+        (profile / "cli.json").write_text(json.dumps({"coordinator": self.server.url}))
+        with mock.patch.dict(os.environ, {"CQ_CONFIG_DIR": str(profile), "CQ_URL": ""}):
+            self.invoke(main, ["ls"])
+        self.assertEqual(self.server.requests[-1][3], "Bearer operator-token")
+
+    def test_missing_selected_token_never_falls_back_to_owner(self):
+        with mock.patch.dict(os.environ, {"CQ_CONFIG_DIR": str(self.home / "missing")}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["ls"]), 2)
+        self.assertEqual(self.server.requests, [])
+
     def test_parse_eta_rolls_past_clock_time_to_tomorrow(self):
         class FrozenDateTime(datetime):
             @classmethod

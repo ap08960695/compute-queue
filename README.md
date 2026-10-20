@@ -5,7 +5,7 @@ A small job queue for a handful of shared machines (Linux GPU workstations and M
 Pure Python 3.11+ standard library. No third-party packages.
 
 - One **Coordinator** holds the queue in SQLite and serves a token-authenticated HTTP API.
-- Each **Node** runs an **Agent** that pulls work, runs every Job under a hard memory cap (systemd `MemoryMax` with no swap on Linux, footprint watch on macOS), and reports back.
+- Each **Node** runs an **Agent** that pulls work, limits memory (systemd `MemoryMax` with no swap on Linux, a sampled footprint watchdog on macOS), and reports back. The Mac watchdog can overshoot between samples; it is not a kernel-enforced cap.
 - Sizing uses measured **Profiles** (peak unreclaimable RAM, VRAM and wall time of earlier runs), not guesses.
 - Queue features: priorities, dependencies, resource-aware backfill, lease-boundary preemption (exit code 6 = checkpointed, resume later), per-node GPU exclusivity and VRAM cap, kernel GPU-fault guard.
 - Roles: Owner, Operator, Submitter, Node. Every mutating call is audited.
@@ -40,11 +40,26 @@ bin/cq ls
 |---|---|
 | Coordinator address, state dir, board file | `cq.coordinator --bind/--state/--board` |
 | CLI token and URL | `~/.config/compute-queue/token` (0600), `CQ_URL` or `~/.config/compute-queue/cli.json` |
+| Separate CLI identities | `CQ_CONFIG_DIR=/path/to/profile`, containing its own `token` and `cli.json`; a missing token fails without falling back to another profile |
 | Agent | `~/.config/compute-queue/agent.json` (0600), written by `install/install.sh` |
 | GPU lock shared with non-queue GPU users | `install.sh --gpu-lock PATH` (default `/tmp/compute-queue-gpu.lock`); CLI route check: `CQ_GPU_LOCK` |
 | Mac lane probe for `computeboard route` | `CQ_MAC_SSH=user@host` |
 
 Bearer tokens travel over plain HTTP. Keep the Coordinator on a trusted LAN or put it behind TLS.
+
+Use distinct Operator tokens for coding assistants and a Submitter token for Hermes.
+The `who` text on a compatibility booking is a note; the authenticated token determines
+ownership and permissions. Operators cannot cancel another identity's jobs. Keep the
+Owner profile for explicitly authorized administrative actions, including node approval
+and fault clearance. On the coordinator host,
+`python3 -m cq.coordinator --add-token NAME operator` creates an Operator token;
+redirect it to a private file rather than a shared log.
+
+GPU lock paths are node configuration. The first path is the allocation's exclusive
+lock; additional paths are probes for legacy workloads. A workload taking an inner
+lock must use a different path from the first one to avoid locking itself out.
+Route all cluster jobs through the coordinator; probes alone cannot serialize
+independent legacy launchers.
 
 ## Tests
 

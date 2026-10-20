@@ -43,7 +43,7 @@ class PermissionsTest(unittest.TestCase):
                 self.check(action, job, (True, True, False, False))
 
     def test_node_admin(self):
-        self.check('node_admin', None, (True, True, False, False))
+        self.check('node_admin', None, (True, False, False, False))
 
     def test_heartbeat_own_node_only(self):
         job = {'submitter': None, 'node': ME}

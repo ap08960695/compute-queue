@@ -22,7 +22,7 @@ DROP_CODES = (400, 404, 409)  # a report the Coordinator will never accept
 KILL_GRACE_S = 20
 VRAM_CAP = 19.5e9
 LAUNCH_FAILED_RC = 125
-KERNEL_SCAN_S = 60  # minimum seconds between kernel log scans
+KERNEL_SCAN_S = 60  # periodic scans; startup and GPU admission explicitly probe
 FAULT_RE = re.compile(r"amdgpu.*(page fault|reset|timeout|hang)|HSA_STATUS_ERROR|oom-kill", re.I)
 UNITS = {"B": 1, "KB": 2**10, "MB": 2**20, "GB": 2**30}
 
@@ -122,6 +122,138 @@ def parse_props(out):
     return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
 
 
+def atomic_write(path, text):
+    """Durable rename: launch intent must reach disk before any child can run."""
+    with open(path + ".tmp", "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(path + ".tmp", path)
+    fd = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def group_running(host, pgid):
+    """Ignore zombies (no resources/work); a failed ps is unknown, never drained."""
+    rc, out = host.run(["ps", "-axo", "pid=,pgid=,stat="])
+    if rc:
+        return None
+    rows = [row.split() for row in out.splitlines()]
+    if not rows or any(len(row) != 3 for row in rows):
+        return None
+    return any(row[1] == str(pgid) and not row[2].startswith("Z") for row in rows)
+
+
+def mac_runner(sdir, argv, lock_path=None):
+    """Single-file supervisor outside the workload group, surviving agent restarts.
+
+    Do NOT reap the direct child until its whole group drains. Even after it exits,
+    its zombie reserves the PID/PGID, so TERM/KILL cannot target a reused group.
+    The exclusive flock stays here, outside the group targeted by those signals.
+    """
+    host = Host()
+    state = {"pid": os.getpid(), "ident": host.run(
+        ["ps", "-p", str(os.getpid()), "-o", "lstart="])[1].strip()}
+    status_path = f"{sdir}/runner.json"
+    atomic_write(status_path, json.dumps(state))
+    # Service/agent termination must not drop the GPU lock under running children.
+    signal.signal(signal.SIGTERM, lambda *_: None)
+    signal.signal(signal.SIGINT, lambda *_: None)
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)  # never auto-reap our PID reservation
+    lock_fd = None
+    child = None
+    gate_r, gate_w = os.pipe()
+    ready_r, ready_w = os.pipe()
+    try:
+        if lock_path:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if os.path.exists(f"{sdir}/stop"):
+                        state.update(done=True, rc=143)
+                        atomic_write(status_path, json.dumps(state))
+                        os.close(lock_fd)
+                        return 0
+                    time.sleep(0.1)
+        if os.path.exists(f"{sdir}/stop"):
+            state.update(done=True, rc=143)
+            atomic_write(status_path, json.dumps(state))
+            if lock_fd is not None:
+                os.close(lock_fd)
+            return 0
+        child = os.fork()
+        if child == 0:
+            try:
+                os.close(gate_w)
+                os.close(ready_r)
+                if lock_fd is not None:
+                    os.close(lock_fd)
+                os.setsid()
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+                os.write(ready_w, b"1")
+                os.close(ready_w)
+                # EOF means supervisor died before persisting our group identity.
+                if os.read(gate_r, 1) != b"1":
+                    os._exit(LAUNCH_FAILED_RC)
+                os.close(gate_r)
+                cmd = (["caffeinate", "-i"] if sys.platform == "darwin" else []) + argv
+                os.execvpe(cmd[0], cmd, os.environ)
+            except BaseException:
+                os._exit(LAUNCH_FAILED_RC)
+        os.close(gate_r)
+        gate_r = None
+        os.close(ready_w)
+        ready_w = None
+        if os.read(ready_r, 1) != b"1":
+            raise OSError("worker failed before setsid handshake")
+        state["pgid"] = child
+        atomic_write(status_path, json.dumps(state))
+        os.write(gate_w, b"1")
+    except Exception:
+        if child is None:
+            state.update(done=True, rc=LAUNCH_FAILED_RC)
+            atomic_write(status_path, json.dumps(state))
+        else:
+            # Closing the gate prevents exec if setup/persistence failed.
+            log.exception("Mac runner setup failed")
+    finally:
+        for fd in (gate_r, gate_w, ready_r, ready_w):
+            if fd is not None:
+                os.close(fd)
+    if child is not None:
+        term_at, killed = None, False
+        while group_running(host, child) is not False:
+            if os.path.exists(f"{sdir}/stop"):
+                try:
+                    if term_at is None:
+                        host.killpg(child, signal.SIGTERM)
+                        term_at = time.monotonic()
+                    elif not killed and time.monotonic() - term_at >= KILL_GRACE_S:
+                        host.killpg(child, signal.SIGKILL)
+                        killed = True
+                except OSError:
+                    # Signal failure must not unwind the supervisor and drop its lock.
+                    log.exception("cannot stop Mac workload group %s; retaining lock", child)
+                    time.sleep(1)
+            time.sleep(0.1)
+        _, status = os.waitpid(child, 0)  # only now may the PID be reused
+        rc = os.waitstatus_to_exitcode(status)
+        rc = 128 - rc if rc < 0 else rc
+        atomic_write(f"{sdir}/rc", str(rc) + "\n")
+        state.update(done=True, rc=rc)
+        atomic_write(status_path, json.dumps(state))
+    if lock_fd is not None:
+        os.close(lock_fd)
+    return 0
+
+
 class Agent:
     def __init__(self, cfg, spool, host=None, now=time.time, proc="/proc", sysfs="/sys",
                  cgroup="/sys/fs/cgroup"):
@@ -139,7 +271,13 @@ class Agent:
         saved = json.loads(read(f"{spool}/allocs.json") or "[]")
         self.allocs = {a["job_id"]: a for a in saved if a.get("state") != "launching"}
         self.intents = {a["job_id"]: a for a in saved if a.get("state") == "launching"}
-        if not self.mac:
+        if self.mac:
+            # A spawn may have succeeded before the allocation save. Never respawn
+            # an ambiguous intent: the runner's durable handshake resolves it.
+            for jid, a in list(self.intents.items()):
+                self.allocs[jid] = self.alloc_from_intent(self.intents.pop(jid))
+            self.save_allocs()
+        else:
             self.adopt_units()
         if self.allocs:
             log.info("reattached %s", sorted(self.allocs))
@@ -188,9 +326,7 @@ class Agent:
         return ok
 
     def write(self, path, text):
-        with open(path + ".tmp", "w") as f:
-            f.write(text)
-        os.replace(path + ".tmp", path)
+        atomic_write(path, text)
 
     def save_allocs(self):
         self.write(f"{self.spool}/allocs.json",
@@ -246,10 +382,13 @@ class Agent:
     def stats(self):
         vram = 0 if self.mac else drm_sum(self.sysfs, "mem_info_vram_used")
         own_gpu = any(a["gpu"] for a in self.allocs.values())
+        if self.gpu_node and not own_gpu:
+            self.kernel_faults()  # discover telemetry loss while idle, too
         busy = max([read_int(p) for p in glob.glob(
             f"{self.sysfs}/class/drm/card[0-9]*/device/gpu_busy_percent")] or [0])
         return {"mem_available": self.mem_available(), "vram_used": vram,
-                "outside_gpu_busy": bool(not own_gpu and (busy >= 50 or self.gpu_lock_held()))}
+                "outside_gpu_busy": bool((not self.mac and not self.journal_ok) or
+                                         (not own_gpu and (busy >= 50 or self.gpu_lock_held())))}
 
     def gpu_lock_held(self):
         """Non-blocking probe: True when someone else holds any configured GPU lock."""
@@ -273,6 +412,20 @@ class Agent:
         text = read(f"{self.cgroup}/{group.strip('/')}/memory.stat") if group else ""
         vals = dict(ln.split() for ln in text.splitlines() if len(ln.split()) == 2)
         return sum(int(vals.get(k, 0)) for k in ("anon", "kernel", "shmem")) if vals else None
+
+    def cgroup_drained(self, group):
+        """cgroup.events includes descendants; an unreadable existing group is not drained."""
+        if not group:
+            return True
+        directory = f"{self.cgroup}/{group.strip('/')}"
+        try:
+            with open(f"{directory}/cgroup.events") as f:
+                events = dict(line.split() for line in f if len(line.split()) == 2)
+            return events.get("populated") == "0"
+        except FileNotFoundError:
+            return not os.path.exists(directory)
+        except (OSError, ValueError):
+            return False
 
     def footprint(self, a):
         """Sum of phys footprint over every process in the allocation's process group."""
@@ -298,7 +451,7 @@ class Agent:
         rc, out = self.host.run(argv, timeout=60)
         if rc != 0:
             self.journal_ok = False
-            log.warning("kernel log guard disabled: sudo -n journalctl -k failed (rc=%s)", rc)
+            log.error("GPU work blocked: sudo -n journalctl -k failed (rc=%s)", rc)
             return None
         self.kernel_scan_at = t
         n = 0
@@ -313,10 +466,16 @@ class Agent:
 
     def start(self, spec):
         jid = int(spec["id"])
-        if jid in self.allocs:
+        if jid in self.allocs or jid in self.intents:
             return
         sdir = f"{self.spool}/signals/{jid}"
         attempt = int(spec.get("attempt") or 0)
+        if not self.mac and spec.get("gpu"):
+            self.kernel_faults(force=True)  # admission must not rely on stale telemetry
+            if not self.journal_ok:
+                self.report(jid, LAUNCH_FAILED_RC, {"peak_ram": 0, "peak_vram": 0},
+                            0, attempt, fault="telemetry")
+                return
         try:
             ram = int(spec.get("effective_ram") or 0)
             if ram <= 0:
@@ -328,6 +487,9 @@ class Agent:
                  "started": self.now(), "current_ram": 0, "current_vram": 0, "peak_ram": 0, "peak_vram": 0}
             argv = list(spec["argv"])
             if self.mac:
+                a["mac_runner"] = True
+                self.intents[jid] = {**a, "state": "launching"}
+                self.save_allocs()
                 self.launch_mac(a, argv, spec.get("cwd"), env)
             else:
                 a["unit"] = f"cq-job-{jid}-a{attempt}.service"
@@ -336,11 +498,17 @@ class Agent:
                 self.launch_linux(a, argv, spec, env)
         except Exception as e:
             log.error("job %s failed to launch: %s", jid, e)
+            if self.mac and jid in self.procs:
+                # Spawn succeeded; an identity/save failure is not a launch failure.
+                self.allocs[jid] = self.alloc_from_intent(self.intents.pop(jid))
+                self.save_allocs()
+                return
             shutil.rmtree(sdir, ignore_errors=True)
             intent = self.intents.pop(jid, None)
             if intent:
                 self.save_allocs()
-                self.host.run(["systemctl", "--user", "stop", "--no-block", intent["unit"]], timeout=120)
+                if not self.mac:
+                    self.host.run(["systemctl", "--user", "stop", "--no-block", intent["unit"]], timeout=120)
             self.report(jid, LAUNCH_FAILED_RC, {"peak_ram": 0, "peak_vram": 0}, 0, attempt)
             return
         self.intents.pop(jid, None)
@@ -364,11 +532,14 @@ class Agent:
             raise OSError(f"systemd-run rc={rc}: {out.strip()[:200]}")
 
     def launch_mac(self, a, argv, cwd, env):
-        # the shell records the real exit code so a restarted agent can still report it
-        wrapped = ["/bin/sh", "-c", 'caffeinate -i "$@"; echo $? > "$CQ_SIGNAL_DIR/rc"', "cq"] + argv
+        wrapped = [sys.executable, os.path.abspath(__file__), "--mac-runner", a["signal_dir"]]
+        locks = self.cfg.get("gpu_locks") or []
+        if a["gpu"] and locks:
+            wrapped += ["--gpu-lock", locks[0]]
+        wrapped += ["--"] + argv
         p = self.host.spawn(wrapped, cwd, {**os.environ, **env}, f"{self.spool}/logs/{a['job_id']}.log")
         self.procs[a["job_id"]] = p
-        a["pid"] = a["pgid"] = p.pid
+        a["pid"] = p.pid
         a["ident"] = self.host.run(["ps", "-p", str(p.pid), "-o", "lstart="])[1].strip()
 
     def mac_alive(self, a):
@@ -376,23 +547,25 @@ class Agent:
         p = self.procs.get(a["job_id"])
         if p is not None:
             return p.poll() is None
-        return bool(a.get("ident")) and self.host.run(
+        return bool(a.get("pid") and a.get("ident")) and self.host.run(
             ["ps", "-p", str(a["pid"]), "-o", "lstart="])[1].strip() == a["ident"]
 
     def mac_group_alive(self, a):
-        """True while our leader runs, or any process is left in a group we started."""
-        return self.mac_alive(a) or (a["job_id"] in self.procs and self.host.group_alive(a["pgid"]))
+        """Occupancy is conservative; it is NOT permission to signal an orphan group."""
+        return self.mac_alive(a) or self.host.group_alive(a["pgid"])
 
     def terminate(self, a, reason):
         """Stop one of our own allocations; poll() reports it once it is gone.
-        reason: cancel | vram | kernel | cap | pressure."""
+        reason: cancel | vram | kernel | telemetry | cap | pressure."""
         if a.get("stop"):
             return
         a["stop"] = reason
         log.warning("stopping job %s: %s", a["job_id"], reason)
         if self.mac:
             a["term_at"] = self.now()
-            if self.mac_group_alive(a):
+            if a.get("mac_runner"):
+                self.write(f"{a['signal_dir']}/stop", reason)
+            elif self.mac_alive(a):
                 self.host.killpg(a["pgid"], signal.SIGTERM)
         else:
             self.host.run(["systemctl", "--user", "stop", "--no-block", a["unit"]], timeout=120)
@@ -407,7 +580,7 @@ class Agent:
                 self.host.run(["systemctl", "--user", "stop", "--no-block", a["unit"]], timeout=120)
             self.host.run(["systemctl", "--user", "reset-failed", a["unit"]])
         extra = {}
-        if reason in ("vram", "kernel"):
+        if reason in ("vram", "kernel", "telemetry"):
             extra["fault"] = reason
         if reason == "cancel":
             extra["cancelled"] = True
@@ -443,10 +616,18 @@ class Agent:
         if rc != 0:
             return
         p = parse_props(out)
-        ram = self.cgroup_ram(p.get("ControlGroup"))
+        group = p.get("ControlGroup") or a.get("cgroup")
+        if group and a.get("cgroup") != group:
+            a["cgroup"] = group
+            self.save_allocs()
+        ram = self.cgroup_ram(group)
         if ram is not None:
             a["current_ram"] = ram
         if p.get("ActiveState") in ("inactive", "failed") or p.get("SubState") == "exited":
+            # The main PID can exit before children (including nested cgroups).
+            # Keep the allocation and heartbeat until the complete group drains.
+            if not self.cgroup_drained(group):
+                return
             status = int(p.get("ExecMainStatus") or 0)
             if p.get("LoadState") == "not-found":
                 status = LAUNCH_FAILED_RC
@@ -455,12 +636,27 @@ class Agent:
             self.finish(a, status)
 
     def poll_mac(self, a):
-        if not (self.mac_group_alive(a) if a.get("stop") else self.mac_alive(a)):
+        if a.get("mac_runner"):
+            try:
+                state = json.loads(read(f"{a['signal_dir']}/runner.json"))
+            except (ValueError, TypeError):
+                return  # uncertain launch: retain allocation, never duplicate it
+            if state.get("done"):
+                self.finish(a, state["rc"])
+                return
+            a.update({k: state[k] for k in ("pid", "ident", "pgid") if k in state})
+            if "pgid" not in a:
+                return  # runner waiting for lock, or setup not durably acknowledged
+            if not self.mac_group_alive(a):
+                self.finish(a, LAUNCH_FAILED_RC)
+                return
+        elif not self.mac_group_alive(a):
             rc_text = read(f"{a['signal_dir']}/rc").strip()
             self.finish(a, int(rc_text) if rc_text.isdigit() else 1)
             return
         a["current_ram"] = self.footprint(a)
-        if a.get("term_at") and self.now() - a["term_at"] >= KILL_GRACE_S:
+        if (not a.get("mac_runner") and self.mac_alive(a) and a.get("term_at")
+                and self.now() - a["term_at"] >= KILL_GRACE_S):
             self.host.killpg(a["pgid"], signal.SIGKILL)
         elif not a.get("stop") and 0 < a["cap"] < a["current_ram"]:
             self.terminate(a, "cap")
@@ -480,7 +676,9 @@ class Agent:
             fault = "vram"
         else:
             n = self.kernel_faults()
-            if n:
+            if not self.journal_ok:
+                fault = "telemetry"
+            elif n:
                 fault = "kernel"
         if fault:
             for a in gpu:
@@ -505,6 +703,8 @@ class Agent:
         for a in list(self.allocs.values()):
             self.poll(a, stats["vram_used"])
         self.guards(stats["vram_used"])
+        if not self.mac and not self.journal_ok:
+            stats["outside_gpu_busy"] = True
         if not self.flush_outbox():
             log.warning("coordinator unreachable; reports queued, starting nothing")
             return
@@ -543,7 +743,13 @@ def main(argv=None):
     ap.add_argument("--hw", action="store_true", help="print hardware JSON and exit")
     ap.add_argument("--config", default=f"{home}/.config/compute-queue/agent.json")
     ap.add_argument("--spool", default=f"{home}/.local/share/compute-queue/agent")
+    ap.add_argument("--mac-runner", help=argparse.SUPPRESS)
+    ap.add_argument("--gpu-lock", help=argparse.SUPPRESS)
+    ap.add_argument("command", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
+    if args.mac_runner:
+        command = args.command[1:] if args.command[:1] == ["--"] else args.command
+        return mac_runner(args.mac_runner, command, args.gpu_lock)
     if args.hw:
         print(json.dumps(hw_info(Host(), platform.system().lower())))
         return 0

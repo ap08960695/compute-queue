@@ -201,6 +201,7 @@ class Base(unittest.TestCase):
         d = self.t / "cgroup/cq" / unit
         d.mkdir(parents=True, exist_ok=True)
         (d / "memory.stat").write_text(f"anon {anon}\nkernel {kernel}\nshmem {shmem}\nfile 99999\n")
+        (d / "cgroup.events").write_text("populated 0\nfrozen 0\n")
 
     def start_job(self, a, jid=7, gpu=False, **extra):
         spec = {"id": jid, "argv": ["python3", "x.py"], "cwd": "/work", "env": {}, "gpu": gpu,
@@ -210,6 +211,38 @@ class Base(unittest.TestCase):
 
 
 class LinuxTests(Base):
+    def test_main_exit_keeps_allocation_until_nested_cgroup_drains(self):
+        a = self.mk()
+        self.start_job(a, gpu=True)
+        unit = "cq-job-7-a0.service"
+        self.set_mem(unit, anon=100)
+        events = self.t / "cgroup/cq" / unit / "cgroup.events"
+        events.write_text("populated 1\nfrozen 0\n")
+        self.host.units[unit] = {"SubState": "exited", "ExecMainStatus": "0"}
+        a.tick()
+        self.assertEqual(self.coord.reports(), [])
+        self.assertEqual(self.host.systemctl("stop"), [])
+        self.assertEqual(self.coord.heartbeats()[-1]["allocs"][0]["job_id"], 7)
+        # Recovery must retain the group path even if systemd no longer returns it.
+        b = self.mk()
+        self.host.units[unit] = {"ActiveState": "inactive", "ControlGroup": ""}
+        b.tick()
+        self.assertEqual(self.coord.reports(), [])
+        events.write_text("populated 0\nfrozen 0\n")
+        b.tick()
+        self.assertEqual([r["rc"] for r in self.coord.reports()], [0])
+
+    def test_missing_events_on_existing_cgroup_does_not_release(self):
+        a = self.mk()
+        self.start_job(a)
+        unit = "cq-job-7-a0.service"
+        self.set_mem(unit, anon=100)
+        (self.t / "cgroup/cq" / unit / "cgroup.events").unlink()
+        self.host.units[unit] = {"SubState": "exited"}
+        a.tick()
+        self.assertEqual(self.coord.reports(), [])
+        self.assertIn(7, a.allocs)
+
     def test_start_builds_exact_systemd_run_argv(self):
         a = self.mk()
         self.start_job(a, env={"A": "1"}, effective_ram=6 * GIB)
@@ -697,16 +730,16 @@ class GuardTests(Base):
         a = self.mk(gpu=True)
         self.start_job(a, gpu=True)
         sudo = lambda: [c for c in self.host.cmds if c[0] == "sudo"]
-        self.assertEqual(len(sudo()), 1)  # baseline at start
+        self.assertEqual(len(sudo()), 2)  # startup baseline plus fresh GPU admission probe
         self.host.journal = (0, "kernel: amdgpu: page fault new\n")
         for _ in range(5):  # ticks inside the interval do not touch the journal
             self.clock[0] += 10
             a.tick()
-        self.assertEqual(len(sudo()), 1)
+        self.assertEqual(len(sudo()), 2)
         self.assertEqual(self.host.systemctl("stop"), [])
         self.clock[0] += 10  # 60 s since baseline
         a.tick()
-        self.assertEqual(len(sudo()), 2)
+        self.assertEqual(len(sudo()), 3)
         self.assertEqual(self.host.systemctl("stop"), ["cq-job-7-a0.service"])
 
     def test_kernel_scan_reads_only_lines_since_previous_scan(self):
@@ -722,126 +755,182 @@ class GuardTests(Base):
         self.clock[0] += 60
         self.assertEqual(a.kernel_faults(), 0)  # the old fault line is not counted again
 
-    def test_kernel_guard_skipped_without_sudo(self):
+    def test_kernel_telemetry_failure_refuses_gpu_but_allows_cpu(self):
         self.host.journal = (1, "sudo: a password is required")
         a = self.mk(gpu=True)
+        self.assertTrue(a.stats()["outside_gpu_busy"])
         self.start_job(a, gpu=True)
         a.tick()
-        a.tick()
+        self.assertFalse(any(c[0] == "systemd-run" for c in self.host.cmds))
+        self.assertEqual([(r["rc"], r["fault"]) for r in self.coord.reports()],
+                         [(agent.LAUNCH_FAILED_RC, "telemetry")])
+        self.start_job(a, jid=8)
+        self.assertIn(8, a.allocs)
         self.assertEqual(self.host.systemctl("stop"), [])
-        self.assertEqual(len([c for c in self.host.cmds if c[0] == "sudo"]), 1)
+
+    def test_active_gpu_telemetry_loss_stops_only_own_gpu_and_faults(self):
+        a = self.mk(gpu=True)
+        self.start_job(a, gpu=True)
+        self.start_job(a, jid=8)
+        self.host.journal = (1, "permission denied")
+        self.clock[0] += 60
+        a.tick()
+        self.assertEqual(self.host.systemctl("stop"), ["cq-job-7-a0.service"])
+        self.assertTrue(self.coord.heartbeats()[-1]["stats"]["outside_gpu_busy"])
+        a.tick()
+        self.assertEqual([(r["job_id"], r["fault"]) for r in self.coord.reports()],
+                         [(7, "telemetry")])
+        self.assertIn(8, a.allocs)
+
+    def test_idle_gpu_telemetry_loss_blocks_next_heartbeat(self):
+        a = self.mk(gpu=True)
+        self.host.journal = (1, "permission denied")
+        self.clock[0] += 60
+        a.tick()
+        self.assertTrue(self.coord.heartbeats()[-1]["stats"]["outside_gpu_busy"])
+
+    def test_gpu_admission_checks_telemetry_even_inside_scan_interval(self):
+        a = self.mk(gpu=True)
+        self.host.journal = (1, "permission denied")
+        self.start_job(a, gpu=True)
+        a.tick()
+        self.assertFalse(any(c[0] == "systemd-run" for c in self.host.cmds))
+        self.assertEqual([r["fault"] for r in self.coord.reports()], ["telemetry"])
 
 
 class MacTests(Base):
-    def mac_start(self, a, ram=1000, jid=3):
-        self.start_job(a, jid=jid, effective_ram=ram, argv=["sleep", "9"])
-        return self.host.spawned[-1]
+    def mac_start(self, a, ram=1000, jid=3, gpu=False):
+        self.start_job(a, jid=jid, gpu=gpu, effective_ram=ram, argv=["sleep", "9"])
+        sp = self.host.spawned[-1]
+        pid = sp["proc"].pid
+        sp["pgid"] = pid + 2
+        self.host.groups[pid + 2] = pid + 2
+        self.host.groups[pid + 3] = pid + 2
+        self.runner_state(jid, pid=pid, ident=self.host.lstart[pid], pgid=pid + 2)
+        return sp
 
-    def test_start_runs_under_caffeinate_in_own_session(self):
+    def runner_state(self, jid=3, **state):
+        (self.spool / f"signals/{jid}/runner.json").write_text(json.dumps(state))
+
+    def test_start_uses_installed_single_file_and_preserves_environment(self):
         a = self.mk("darwin")
         sp = self.mac_start(a)
-        self.assertEqual(sp["argv"][:2], ["/bin/sh", "-c"])
-        self.assertIn("caffeinate -i", sp["argv"][2])
-        self.assertEqual(sp["argv"][-2:], ["sleep", "9"])
+        self.assertEqual(sp["argv"][:3], [sys.executable, str(ROOT / "cq/agent.py"), "--mac-runner"])
+        self.assertEqual(sp["argv"][-3:], ["--", "sleep", "9"])
         self.assertEqual(sp["cwd"], "/work")
         self.assertEqual(sp["env"]["CQ_JOB_ID"], "3")
         self.assertEqual(sp["env"]["CQ_SIGNAL_DIR"], f"{self.spool}/signals/3")
-        self.assertEqual([c for c in self.host.cmds if c[0] == "systemd-run"], [])
+        self.assertFalse(any(c[0] == "systemd-run" for c in self.host.cmds))
 
-    def test_finish_reads_rc_file(self):
+    def test_gpu_uses_first_configured_lock_cpu_never_does(self):
+        a = self.mk("darwin", gpu_locks=["/config/first", "/config/second"])
+        sp = self.mac_start(a, gpu=True)
+        self.assertEqual(sp["argv"][4:6], ["--gpu-lock", "/config/first"])
+        sp = self.mac_start(a, jid=4)
+        self.assertNotIn("--gpu-lock", sp["argv"])
+        self.assertNotIn("/config/first", sp["argv"])
+
+    def test_request_cannot_supply_gpu_lock(self):
+        a = self.mk("darwin")
+        self.start_job(a, gpu=True, gpu_locks=["/untrusted/lock"])
+        self.assertNotIn("--gpu-lock", self.host.spawned[-1]["argv"])
+
+    def test_done_handshake_records_real_rc_after_restart(self):
+        a = self.mk("darwin")
+        self.mac_start(a)
+        self.runner_state(done=True, rc=17)
+        b = self.mk("darwin")
+        b.tick()
+        self.assertEqual([(r["job_id"], r["rc"]) for r in self.coord.reports()], [(3, 17)])
+
+    def test_runner_death_never_releases_live_children_or_signals_reused_pid(self):
         a = self.mk("darwin")
         sp = self.mac_start(a)
-        (self.spool / "signals/3/rc").write_text("0\n")
-        sp["proc"].returncode = 0
-        a.tick()
-        self.assertEqual([(r["job_id"], r["rc"]) for r in self.coord.reports()], [(3, 0)])
-
-    def test_cap_exceeded_term_then_kill_after_grace(self):
-        a = self.mk("darwin")
-        sp = self.mac_start(a)
-        pid = sp["proc"].pid
-        self.host.footprints[pid] = 1200
-        self.host.footprints[pid + 1] = 300  # child counts toward the cap
-        a.tick()
-        self.assertEqual(self.host.signals, [(pid, signal.SIGTERM)])
-        self.clock[0] += 10
-        a.tick()
-        self.assertEqual(self.host.signals, [(pid, signal.SIGTERM)])
-        self.clock[0] += 15
-        a.tick()
-        self.assertEqual(self.host.signals, [(pid, signal.SIGTERM), (pid, signal.SIGKILL)])
         sp["proc"].returncode = -9
-        self.host.groups.clear()
-        a.tick()
-        r = self.coord.reports()[0]
-        self.assertEqual((r["job_id"], r["rc"]), (3, 137))
-        self.assertNotIn("fault", r)
-
-    def test_stop_waits_for_the_whole_group_before_reporting(self):
-        a = self.mk("darwin")
-        sp = self.mac_start(a)
-        pid = sp["proc"].pid
+        self.host.lstart[sp["proc"].pid] = "different process"
+        b = self.mk("darwin")
         self.coord.next_reply = {"cancel": [3]}
-        a.tick()
-        self.assertEqual(self.host.signals, [(pid, signal.SIGTERM)])
-        sp["proc"].returncode = 0  # leader exits on SIGTERM, a child (pid+1) lingers in the group
-        for _ in range(3):
-            self.clock[0] += 5
-            a.tick()
+        b.tick()
+        self.clock[0] += 30
+        b.tick()
         self.assertEqual(self.coord.reports(), [])
-        self.assertEqual(list(a.allocs), [3])
+        self.assertEqual(self.host.signals, [])
+        self.assertEqual((self.spool / "signals/3/stop").read_text(), "cancel")
         self.assertEqual([x["job_id"] for x in self.coord.heartbeats()[-1]["allocs"]], [3])
-        self.assertEqual(self.host.signals, [(pid, signal.SIGTERM)])
-        self.clock[0] += 10  # past 20 s since SIGTERM
-        a.tick()
-        self.assertEqual(self.host.signals, [(pid, signal.SIGTERM), (pid, signal.SIGKILL)])
-        self.assertEqual(self.coord.reports(), [])  # SIGKILL sent, group not yet confirmed gone
         self.host.groups.clear()
-        a.tick()
-        self.assertEqual([(r["job_id"], r["rc"], r["cancelled"]) for r in self.coord.reports()],
-                         [(3, 143, True)])
-        self.assertEqual(a.allocs, {})
-        self.assertEqual(self.host.signals, [(pid, signal.SIGTERM), (pid, signal.SIGKILL)])
+        b.tick()
+        self.assertEqual([(r["rc"], r["cancelled"]) for r in self.coord.reports()], [(143, True)])
 
-    def test_stop_with_leader_and_children_gone_before_kill_needs_no_sigkill(self):
+    def test_cap_counts_children_and_requests_runner_stop(self):
         a = self.mk("darwin")
         sp = self.mac_start(a)
-        pid = sp["proc"].pid
-        self.host.footprints[pid] = 5000
+        self.host.footprints[sp["pgid"]] = 800
+        self.host.footprints[sp["pgid"] + 1] = 300
         a.tick()
-        sp["proc"].returncode = -15
-        self.host.groups.clear()
-        self.clock[0] += 1
+        self.assertEqual((self.spool / "signals/3/stop").read_text(), "cap")
+        self.assertEqual(self.host.signals, [])
+        self.runner_state(done=True, rc=137)
         a.tick()
         self.assertEqual([r["rc"] for r in self.coord.reports()], [137])
-        self.assertEqual(self.host.signals, [(pid, signal.SIGTERM)])
-
-    def test_real_host_group_alive_tracks_process_group(self):
-        p = subprocess.Popen(["sleep", "30"], start_new_session=True)
-        self.addCleanup(p.wait)
-        self.addCleanup(p.kill)
-        host = agent.Host()
-        self.assertTrue(host.group_alive(p.pid))
-        p.kill()
-        p.wait()
-        self.assertFalse(host.group_alive(p.pid))
 
     def test_under_cap_is_left_alone(self):
         a = self.mk("darwin")
         sp = self.mac_start(a)
-        self.host.footprints[sp["proc"].pid] = 900
+        self.host.footprints[sp["pgid"]] = 900
         a.tick()
+        self.assertFalse((self.spool / "signals/3/stop").exists())
         self.assertEqual(self.host.signals, [])
 
-    def test_memory_pressure_level_4_kills_largest(self):
+    def test_pressure_requests_stop_of_largest_allocation(self):
         a = self.mk("darwin")
         s1 = self.mac_start(a, ram=10_000, jid=3)
         s2 = self.mac_start(a, ram=10_000, jid=4)
-        self.host.footprints[s1["proc"].pid] = 100
-        self.host.footprints[s2["proc"].pid] = 500
+        self.host.footprints[s1["pgid"]] = 100
+        self.host.footprints[s2["pgid"]] = 500
         self.host.pressure = 4
         a.tick()
-        self.assertEqual(self.host.signals, [(s2["proc"].pid, signal.SIGTERM)])
+        self.assertFalse((self.spool / "signals/3/stop").exists())
+        self.assertEqual((self.spool / "signals/4/stop").read_text(), "pressure")
+        self.assertEqual(self.host.signals, [])
+
+    def test_spawn_has_durable_intent_and_restart_does_not_duplicate(self):
+        a = self.mk("darwin")
+        spawn = self.host.spawn
+        captured = []
+        def check_intent(*args, **kwargs):
+            captured.extend(json.loads((self.spool / "allocs.json").read_text()))
+            self.assertEqual(captured[0]["state"], "launching")
+            return spawn(*args, **kwargs)
+        with mock.patch.object(self.host, "spawn", side_effect=check_intent):
+            self.mac_start(a)
+        (self.spool / "allocs.json").write_text(json.dumps(captured))
+        b = self.mk("darwin")
+        self.start_job(b, jid=3)
+        self.assertEqual(len(self.host.spawned), 1)
+        self.assertIn(3, b.allocs)
+        self.assertEqual(self.coord.reports(), [])
+
+    def test_unknown_launch_intent_is_held_without_spawning_or_reporting(self):
+        a = self.mk("darwin")
+        self.mac_start(a)
+        (self.spool / "signals/3/runner.json").unlink()
+        data = json.loads((self.spool / "allocs.json").read_text())
+        data[0]["state"] = "launching"
+        (self.spool / "allocs.json").write_text(json.dumps(data))
+        b = self.mk("darwin")
+        self.start_job(b, jid=3)
+        self.assertEqual(len(self.host.spawned), 1)
+        self.assertIn(3, b.allocs)
+        self.assertEqual(self.coord.reports(), [])
+
+    def test_spawn_failure_reports_without_systemctl(self):
+        a = self.mk("darwin")
+        with mock.patch.object(self.host, "spawn", side_effect=OSError("bad cwd")):
+            self.start_job(a, jid=3)
+        a.tick()
+        self.assertEqual([r["rc"] for r in self.coord.reports()], [agent.LAUNCH_FAILED_RC])
+        self.assertFalse(any(c[0] == "systemctl" for c in self.host.cmds))
+        self.assertEqual(a.allocs, {})
 
 
 class OwnPidTests(Base):
@@ -853,6 +942,29 @@ class OwnPidTests(Base):
     def seed(self, pid, ident):
         self.spool.mkdir(parents=True)
         (self.spool / "allocs.json").write_text(json.dumps([self.entry(pid, ident)]))
+
+    def test_restart_with_missing_leader_retains_live_children_without_signals(self):
+        self.seed(4242, "Mon Oct 19 09:00:00 2026")
+        self.host.groups[4243] = 4242
+        a = self.mk("darwin")
+        self.coord.next_reply = {"cancel": [5]}
+        a.tick()
+        self.clock[0] += 30
+        a.tick()
+        self.assertEqual(self.coord.reports(), [])
+        self.assertEqual(self.host.signals, [])
+        self.assertIn(5, a.allocs)
+        self.host.groups.clear()
+        a.tick()
+        self.assertEqual([r["rc"] for r in self.coord.reports()], [143])
+
+    def test_normal_completion_retains_children_after_leader_exits(self):
+        self.seed(4242, "Mon Oct 19 09:00:00 2026")
+        self.host.groups[4243] = 4242
+        a = self.mk("darwin")
+        a.tick()
+        self.assertEqual(self.coord.reports(), [])
+        self.assertIn(5, a.allocs)
 
     def test_cancel_unknown_job_signals_nothing(self):
         a = self.mk("darwin")
@@ -869,7 +981,8 @@ class OwnPidTests(Base):
         self.coord.next_reply = {"cancel": [5]}
         a.tick()
         self.assertEqual(self.host.signals, [])
-        self.assertEqual([(r["job_id"], r["rc"]) for r in self.coord.reports()], [(5, 1)])
+        self.assertEqual(self.coord.reports(), [])
+        self.assertIn(5, a.allocs)
 
     def test_reattached_process_with_matching_identity_can_be_cancelled(self):
         self.seed(4242, "Mon Oct 19 09:00:00 2026")

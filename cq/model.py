@@ -344,7 +344,11 @@ def allowed(role, principal, action, job):
         return False
     if action in ("submit", "view", "list", "show"):
         return True
-    if action in ("urgent", "preempt", "node_admin"):
+    if action == "node_admin":
+        # A node can execute/report any job assigned to it. Letting operators
+        # enroll their own node would bypass the foreign-job cancellation rule.
+        return role == "owner"
+    if action in ("urgent", "preempt"):
         return role in ("owner", "operator")
     if action in ("move", "priority"):
         return role in ("owner", "operator") or job.get("submitter") == principal

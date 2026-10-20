@@ -24,7 +24,8 @@ class CliError(Exception):
 
 
 def _config_dir():
-    return Path.home() / ".config" / "compute-queue"
+    selected = os.environ.get("CQ_CONFIG_DIR")
+    return Path(selected).expanduser() if selected else Path.home() / ".config" / "compute-queue"
 
 
 class Coordinator:

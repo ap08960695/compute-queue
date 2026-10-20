@@ -75,10 +75,14 @@ Pure function over DB state (no I/O besides the DB). Called on every heartbeat f
 | move/priority own job | yes | yes | yes | no |
 | move/priority other's job | yes | yes | no | no |
 | set urgent, preempt | yes | yes | no | no |
-| node invite/approve/disable/clear-fault | yes | yes | no | no |
+| node invite/approve/disable/clear-fault | yes | no | no | no |
 | heartbeat, report | no | no | no | own node only |
 
 Every mutating call writes one audit row with principal and `reason` (required for operator actions on others' jobs).
+
+Node administration requires Owner approval: a registered node executes and reports
+jobs assigned to it, so allowing Operators to approve their own nodes would bypass
+the restriction on ending other identities' jobs.
 
 ## HTTP API (JSON, `Authorization: Bearer <token>`)
 
@@ -95,10 +99,10 @@ Coordinator binds to a configured address (default `127.0.0.1:8765`; LAN address
 
 - Config `~/.config/compute-queue/agent.json` (mode 0600): `{coordinator, token, node, os}`. Local spool `~/.local/share/compute-queue/agent/` holds `allocs.json` (running allocations, for reattach) and `outbox.jsonl` (unsent reports).
 - Every 10 s: sample stats, send heartbeat, act on reply. If the Coordinator is unreachable: keep monitoring, queue reports in outbox, start nothing. Resend outbox first on reconnect.
-- Linux launch: `systemd-run --user --unit cq-job-<id> --property=MemoryMax=<effective_ram> --property=MemorySwapMax=0 --property=KillMode=control-group --property=RemainAfterExit=yes --property=Type=exec --working-directory=<cwd>` with env `CQ_JOB_ID`, `CQ_SIGNAL_DIR` plus job env. GPU jobs on ai are wrapped in `flock -x <first gpu_lock>`. Never pass `--collect`. Read RAM from the unit cgroup `memory.stat` (anon+kernel+shmem). Finished = `ActiveState` inactive/failed or `SubState=exited`; rc from `ExecMainStatus`; then `systemctl --user stop` the unit.
-- macOS launch: `subprocess.Popen(start_new_session=True)` under `caffeinate -i`; RAM from `footprint -p`; kill (SIGTERM, 20 s, SIGKILL on the process group) when footprint > effective_ram cap or `kern.memorystatus_vm_pressure_level >= 4`.
+- Linux launch: `systemd-run --user --unit cq-job-<id>-a<attempt> --property=MemoryMax=<effective_ram> --property=MemorySwapMax=0 --property=KillMode=control-group --property=RemainAfterExit=yes --property=Type=exec --working-directory=<cwd>` with env `CQ_JOB_ID`, `CQ_SIGNAL_DIR` plus job env. GPU jobs on ai are wrapped in `flock -x <first gpu_lock>`. Never pass `--collect`. Read RAM from the unit cgroup `memory.stat` (anon+kernel+shmem). A terminal main process is not enough: require `cgroup.events` to show `populated 0` (including descendants), or confirm the group no longer exists, before reporting completion. Unreadable existing groups retain their allocation. Preserve the cgroup path across agent restarts.
+- macOS launch: a supervisor in the standalone agent file holds the first configured GPU lock for GPU jobs and runs the workload in a separate process group under `caffeinate -i`. It persists child identity before allowing exec, retains the child's PID until the whole group drains, then records the exit code. The agent persists launch intent before spawning, so a restart retains uncertain allocations instead of launching duplicates. RAM is sampled using `footprint -p`; the supervisor applies SIGTERM then SIGKILL after 20 s when the agent requests cancellation, the sampled footprint exceeds the cap, or memory pressure reaches level 4. This is a watchdog, not a hard memory limit.
 - Preempt: create `$CQ_SIGNAL_DIR/LEASE-END-REQUESTED`; never kill. Cancel: stop the unit / kill the process group.
-- Guards (Linux GPU node): VRAM total > `vram_cap` -> stop the GPU allocation and report `fault: "vram"`; new kernel lines matching `amdgpu.*(page fault|reset|timeout|hang)|HSA_STATUS_ERROR|oom-kill` since agent start (`sudo -n journalctl -k -b`, skipped with a logged warning if sudo is unavailable) -> stop GPU allocations, report `fault: "kernel"`.
+- Guards (Linux GPU node): VRAM total > `vram_cap` -> stop the GPU allocation and report `fault: "vram"`; new kernel lines matching `amdgpu.*(page fault|reset|timeout|hang)|HSA_STATUS_ERROR|oom-kill` since agent start -> stop GPU allocations, report `fault: "kernel"`. If kernel telemetry becomes unavailable, block new GPU starts and stop any owned GPU allocation with `fault: "telemetry"`; CPU work remains available.
 - The Agent stops only its own units/process groups. It never signals any other process (always-on services, other agents, other sessions).
 - `agent.py --hw` prints JSON `{os, ram_total, cpu, gpus:[{name, vram_total}]}` (Linux: /proc/meminfo, /sys/class/drm/card*/device/mem_info_vram_total; macOS: sysctl hw.memsize, machdep.cpu.brand_string).
 
